@@ -2,6 +2,9 @@
 
 Stores receipts in a local directory structure. User-owned. Exportable.
 No cloud, no blockchain required. Just files.
+
+Evidence files are encrypted at rest when a user_commitment is provided.
+Receipts are plaintext (they contain no PII by schema design).
 """
 
 import json
@@ -11,8 +14,16 @@ from datetime import datetime, timezone
 
 try:
     from .receipts import receipt_hash, validate_receipt
+    from .crypto import (
+        generate_vault_salt, derive_vault_key,
+        encrypt_evidence, decrypt_evidence, VAULT_SALT_FILE,
+    )
 except ImportError:
     from receipts import receipt_hash, validate_receipt
+    from crypto import (
+        generate_vault_salt, derive_vault_key,
+        encrypt_evidence, decrypt_evidence, VAULT_SALT_FILE,
+    )
 
 DEFAULT_VAULT = Path(os.environ.get("ALMANAC_VAULT", "~/.almanac")).expanduser()
 
@@ -36,10 +47,12 @@ SCHEMA_TO_SUBDIR = {
 
 
 class Vault:
-    """Local receipt vault."""
+    """Local receipt vault with optional encryption at rest for evidence."""
 
-    def __init__(self, root: Path | str | None = None):
+    def __init__(self, root: Path | str | None = None, user_commitment: str = ""):
         self.root = Path(root) if root else DEFAULT_VAULT
+        self._user_commitment = user_commitment
+        self._vault_key: bytes | None = None
 
     def init(self) -> Path:
         """Create vault directory structure. Idempotent."""
@@ -53,7 +66,23 @@ class Vault:
                 "You own this data. It never leaves your machine unless you export it.\n\n"
                 f"Created: {datetime.now(timezone.utc).isoformat()}\n"
             )
+        if self._user_commitment:
+            self._init_encryption()
         return self.root
+
+    def _init_encryption(self):
+        """Initialize or load vault encryption key from salt + user commitment."""
+        salt_path = self.root / VAULT_SALT_FILE
+        if salt_path.exists():
+            vault_salt = salt_path.read_text().strip()
+        else:
+            vault_salt = generate_vault_salt()
+            salt_path.write_text(vault_salt + "\n")
+        self._vault_key = derive_vault_key(self._user_commitment, vault_salt)
+
+    @property
+    def encrypted(self) -> bool:
+        return self._vault_key is not None
 
     def store(self, receipt: dict) -> Path:
         """Validate and store a receipt. Returns the file path."""
@@ -87,14 +116,32 @@ class Vault:
         return path
 
     def store_evidence(self, evidence_hash: str, data: str | bytes) -> Path:
-        """Store raw evidence locally (never exported by default)."""
+        """Store raw evidence locally, encrypted at rest if vault has a key."""
         evidence_dir = self.root / "evidence"
         evidence_dir.mkdir(parents=True, exist_ok=True)
-        path = evidence_dir / f"{evidence_hash[:16]}.bin"
         if isinstance(data, str):
             data = data.encode()
+        if self._vault_key:
+            data = encrypt_evidence(data, self._vault_key)
+            path = evidence_dir / f"{evidence_hash[:16]}.enc"
+        else:
+            path = evidence_dir / f"{evidence_hash[:16]}.bin"
         path.write_bytes(data)
         return path
+
+    def load_evidence(self, evidence_hash: str) -> bytes:
+        """Load and decrypt evidence by hash prefix."""
+        evidence_dir = self.root / "evidence"
+        enc_path = evidence_dir / f"{evidence_hash[:16]}.enc"
+        bin_path = evidence_dir / f"{evidence_hash[:16]}.bin"
+        if enc_path.exists():
+            if not self._vault_key:
+                raise ValueError("Evidence is encrypted but no user_commitment provided")
+            return decrypt_evidence(enc_path.read_bytes(), self._vault_key)
+        elif bin_path.exists():
+            return bin_path.read_bytes()
+        else:
+            raise FileNotFoundError(f"No evidence for hash {evidence_hash[:16]}")
 
     def list_receipts(self, subdir: str = "") -> list[Path]:
         """List all receipt files, optionally filtered by subdirectory."""
