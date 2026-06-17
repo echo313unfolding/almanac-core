@@ -5,10 +5,11 @@ Open receipt protocol for personal data-rights infrastructure.
 ## Audit Gate
 
 ```text
-Almanac Core receipt protocol: 60/60 PASS
-  test_receipts:  27 (schemas, chain, vault, demo)
-  test_crypto:    14 (key derivation, encrypt/decrypt, vault encryption, security)
-  test_safety:    19 (risk scoring, cohort gates, contextual adjustments)
+Almanac Core receipt protocol: 88/88 PASS
+  test_receipts:   27 (schemas, chain, vault, demo)
+  test_crypto:     14 (v1 key derivation, Fernet encrypt/decrypt, vault encryption)
+  test_crypto_v2:  28 (structure binding, AES-256-GCM, KEK/DEK, AAD, tamper detection)
+  test_safety:     19 (risk scoring, cohort gates, contextual adjustments)
 ```
 
 ## What is proven
@@ -22,12 +23,22 @@ Almanac Core receipt protocol: 60/60 PASS
 * Local vault stores and summarizes receipts.
 * End-to-end privacy receipt demo runs.
 * No raw PII is required in receipts.
-* Vault evidence encrypted at rest (HKDF + Fernet/AES).
+* Vault evidence encrypted at rest (v1: HKDF + Fernet, v2: AES-256-GCM).
 * Encryption requires vault_secret (private) + user_commitment (public) + vault_salt.
 * Public components alone (commitment + salt) cannot derive the vault key.
 * Commitment without secret does not enable encryption (fail-safe).
 * Wrong secret cannot decrypt evidence.
 * Vault salt persists across reopens.
+* v2: scrypt passphrase hardening + HKDF context binding.
+* v2: Per-blob DEK wrapped by KEK (key hierarchy).
+* v2: Structure context (receipt_id, chain_position, policy_hash) binds the key.
+* v2: Different receipt context produces different KEK and different ciphertext.
+* v2: Wrong receipt_id, wrong previous_hash, wrong policy_hash all fail decrypt.
+* v2: Tampered AAD (structure context) fails GCM authentication.
+* v2: Tampered ciphertext fails GCM authentication.
+* v2: Canonical structure hash is deterministic.
+* v2: No raw PII appears in encrypted envelope fields.
+* v2: Envelope serialization round-trips correctly.
 * PII risk scoring across 15 record categories (6 dimensions).
 * High-risk categories (SSN, health, mugshot) correctly blocked.
 * Cohort safety gate enforces minimums (50 default, 100 sensitive).
@@ -42,8 +53,32 @@ Almanac Core receipt protocol: 60/60 PASS
 * Adoption by privacy companies.
 * Differential privacy noise injection.
 * Rotating identity commitments.
+* Post-quantum key encapsulation (ML-KEM / FIPS 203).
+* Post-quantum receipt signatures (ML-DSA / FIPS 204).
+* Hash-based backup signatures (SLH-DSA / FIPS 205).
 
-## Doctrine
+## Encryption Doctrine
+
+The structure binds the key.
+The secret unlocks it.
+The receipt gates access.
+Revocation destroys it.
+
+Almanac does not invent new cryptography. It uses standardized primitives
+(AES-256-GCM, scrypt, HKDF-SHA256) wrapped in a bio-inspired structure-bound
+vault model: receipt chains, contextual binding, rotating commitments,
+capsule boundaries, and policy-gated access.
+
+## PQ Roadmap
+
+```text
+v0.2: Encrypted local vault with structure-bound keys (Fernet MVP)
+v0.3: AES-256-GCM + AAD + scrypt/HKDF + structure-bound envelope  ← current
+v0.4: PQ-ready interfaces (ML-KEM/ML-DSA/SLH-DSA type stubs)
+v1.0: ML-KEM/ML-DSA/SLH-DSA wired and tested
+```
+
+## Protocol Doctrine
 
 Almanac Core is not a data marketplace.
 
