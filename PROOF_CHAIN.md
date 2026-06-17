@@ -5,10 +5,11 @@ Open receipt protocol for personal data-rights infrastructure.
 ## Audit Gate
 
 ```text
-Almanac Core receipt protocol: 88/88 PASS
+Almanac Core receipt protocol: 104/104 PASS
   test_receipts:   27 (schemas, chain, vault, demo)
   test_crypto:     14 (v1 key derivation, Fernet encrypt/decrypt, vault encryption)
   test_crypto_v2:  28 (structure binding, AES-256-GCM, KEK/DEK, AAD, tamper detection)
+  test_vault_v2:   16 (vault↔crypto_v2 integration, auto-detect, salt persistence)
   test_safety:     19 (risk scoring, cohort gates, contextual adjustments)
 ```
 
@@ -29,6 +30,13 @@ Almanac Core receipt protocol: 88/88 PASS
 * Commitment without secret does not enable encryption (fail-safe).
 * Wrong secret cannot decrypt evidence.
 * Vault salt persists across reopens.
+* crypto_v2 is the default vault evidence encryption path (.v2.json).
+* Vault auto-detects evidence format: .v2.json → .enc (legacy) → .bin (plaintext).
+* v2 salts (vault_salt_v2.key, scrypt_salt_v2.key) persist across vault reopens.
+* vault_id derived from SHA-256 of v2 vault_salt.
+* Default structure context binds evidence to user_commitment + evidence_hash + vault_id.
+* Wrong structure context (receipt_id, policy_hash) fails v2 vault decrypt.
+* Encrypted v2 vault without secret on load raises descriptive error.
 * v2: scrypt passphrase hardening + HKDF context binding.
 * v2: Per-blob DEK wrapped by KEK (key hierarchy).
 * v2: Structure context (receipt_id, chain_position, policy_hash) binds the key.

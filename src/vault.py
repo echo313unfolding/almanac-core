@@ -3,11 +3,16 @@
 Stores receipts in a local directory structure. User-owned. Exportable.
 No cloud, no blockchain required. Just files.
 
-Evidence files are encrypted at rest when a vault_secret is provided.
+Evidence encryption:
+  v2 (default): AES-256-GCM structure-bound envelope via crypto_v2.
+  v1 (legacy):  Fernet via crypto.py — loaded for backwards compatibility.
+  plaintext:    .bin fallback when no vault_secret is provided.
+
 Receipts are portable and plaintext (they contain no PII by schema design).
 The vault_secret must never be committed, exported, or stored in the vault.
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,14 +22,36 @@ try:
     from .receipts import receipt_hash, validate_receipt
     from .crypto import (
         generate_vault_salt, derive_vault_key,
-        encrypt_evidence, decrypt_evidence, VAULT_SALT_FILE,
+        encrypt_evidence as _fernet_encrypt,
+        decrypt_evidence as _fernet_decrypt,
+        VAULT_SALT_FILE as V1_SALT_FILE,
     )
+    from .crypto_v2 import (
+        generate_salt,
+        encrypt_evidence as _v2_encrypt,
+        decrypt_evidence as _v2_decrypt,
+        EncryptedEnvelope,
+        VAULT_SALT_FILE as V2_SALT_FILE,
+        SCRYPT_SALT_FILE,
+    )
+    from .structure_key import build_structure_context
 except ImportError:
     from receipts import receipt_hash, validate_receipt
     from crypto import (
         generate_vault_salt, derive_vault_key,
-        encrypt_evidence, decrypt_evidence, VAULT_SALT_FILE,
+        encrypt_evidence as _fernet_encrypt,
+        decrypt_evidence as _fernet_decrypt,
+        VAULT_SALT_FILE as V1_SALT_FILE,
     )
+    from crypto_v2 import (
+        generate_salt,
+        encrypt_evidence as _v2_encrypt,
+        decrypt_evidence as _v2_decrypt,
+        EncryptedEnvelope,
+        VAULT_SALT_FILE as V2_SALT_FILE,
+        SCRYPT_SALT_FILE,
+    )
+    from structure_key import build_structure_context
 
 DEFAULT_VAULT = Path(os.environ.get("ALMANAC_VAULT", "~/.almanac")).expanduser()
 
@@ -48,10 +75,13 @@ SCHEMA_TO_SUBDIR = {
 
 
 class Vault:
-    """Local receipt vault with optional encryption at rest for evidence.
+    """Local receipt vault with structure-bound encryption at rest for evidence.
 
     Encryption requires both user_commitment (public, appears in receipts)
     and vault_secret (private passphrase/device key, never stored here).
+
+    New evidence uses crypto_v2 (AES-256-GCM + structure binding).
+    Legacy v1 Fernet .enc files still load for backwards compatibility.
     """
 
     def __init__(
@@ -63,7 +93,12 @@ class Vault:
         self.root = Path(root) if root else DEFAULT_VAULT
         self._user_commitment = user_commitment
         self._vault_secret = vault_secret
+        # v1 legacy key (Fernet)
         self._vault_key: bytes | None = None
+        # v2 salts (AES-256-GCM)
+        self._v2_vault_salt: bytes | None = None
+        self._v2_scrypt_salt: bytes | None = None
+        self._vault_id: str = ""
 
     def init(self) -> Path:
         """Create vault directory structure. Idempotent."""
@@ -78,12 +113,13 @@ class Vault:
                 f"Created: {datetime.now(timezone.utc).isoformat()}\n"
             )
         if self._vault_secret and self._user_commitment:
-            self._init_encryption()
+            self._init_v1_encryption()
+            self._init_v2_encryption()
         return self.root
 
-    def _init_encryption(self):
-        """Initialize or load vault encryption key from secret + commitment + salt."""
-        salt_path = self.root / VAULT_SALT_FILE
+    def _init_v1_encryption(self):
+        """Initialize legacy v1 Fernet key for reading old .enc files."""
+        salt_path = self.root / V1_SALT_FILE
         if salt_path.exists():
             vault_salt = salt_path.read_text().strip()
         else:
@@ -93,9 +129,45 @@ class Vault:
             self._vault_secret, self._user_commitment, vault_salt
         )
 
+    def _init_v2_encryption(self):
+        """Initialize v2 AES-256-GCM salts."""
+        vs_path = self.root / V2_SALT_FILE
+        if vs_path.exists():
+            self._v2_vault_salt = bytes.fromhex(vs_path.read_text().strip())
+        else:
+            self._v2_vault_salt = generate_salt()
+            vs_path.write_text(self._v2_vault_salt.hex() + "\n")
+
+        ss_path = self.root / SCRYPT_SALT_FILE
+        if ss_path.exists():
+            self._v2_scrypt_salt = bytes.fromhex(ss_path.read_text().strip())
+        else:
+            self._v2_scrypt_salt = generate_salt()
+            ss_path.write_text(self._v2_scrypt_salt.hex() + "\n")
+
+        self._vault_id = hashlib.sha256(self._v2_vault_salt).hexdigest()[:16]
+
     @property
     def encrypted(self) -> bool:
-        return self._vault_key is not None
+        return self._v2_vault_salt is not None
+
+    @property
+    def vault_id(self) -> str:
+        return self._vault_id
+
+    def _default_structure_context(self, evidence_hash: str, **overrides) -> dict:
+        """Build a minimal deterministic structure context for evidence."""
+        ctx = build_structure_context(
+            user_commitment=self._user_commitment,
+            capsule_type=overrides.get("capsule_type", "vault_evidence"),
+            vault_id=self._vault_id,
+            receipt_schema=overrides.get("receipt_schema", ""),
+            receipt_id=overrides.get("receipt_id", evidence_hash),
+            previous_receipt_hash=overrides.get("previous_receipt_hash", ""),
+            policy_hash=overrides.get("policy_hash", ""),
+            chain_position=overrides.get("chain_position", 0),
+        )
+        return ctx
 
     def store(self, receipt: dict) -> Path:
         """Validate and store a receipt. Returns the file path."""
@@ -128,31 +200,84 @@ class Vault:
         path.write_text(json.dumps(chain, indent=2) + "\n")
         return path
 
-    def store_evidence(self, evidence_hash: str, data: str | bytes) -> Path:
-        """Store raw evidence locally, encrypted at rest if vault has a key."""
+    def store_evidence(
+        self,
+        evidence_hash: str,
+        data: str | bytes,
+        structure_context: dict | None = None,
+    ) -> Path:
+        """Store raw evidence locally, encrypted at rest if vault has a secret.
+
+        Uses crypto_v2 (AES-256-GCM + structure binding) by default.
+        Falls back to plaintext .bin if no vault_secret is provided.
+        """
         evidence_dir = self.root / "evidence"
         evidence_dir.mkdir(parents=True, exist_ok=True)
         if isinstance(data, str):
             data = data.encode()
-        if self._vault_key:
-            data = encrypt_evidence(data, self._vault_key)
-            path = evidence_dir / f"{evidence_hash[:16]}.enc"
+
+        if self._v2_vault_salt and self._v2_scrypt_salt:
+            # v2: AES-256-GCM with structure binding
+            ctx = structure_context or self._default_structure_context(evidence_hash)
+            envelope = _v2_encrypt(
+                data,
+                self._vault_secret,
+                self._user_commitment,
+                self._v2_vault_salt,
+                self._v2_scrypt_salt,
+                ctx,
+            )
+            stored = envelope.to_dict()
+            stored["ciphertext_hex"] = envelope.ciphertext.hex()
+            path = evidence_dir / f"{evidence_hash[:16]}.v2.json"
+            path.write_text(json.dumps(stored, indent=2) + "\n")
         else:
+            # No encryption — plaintext fallback
             path = evidence_dir / f"{evidence_hash[:16]}.bin"
-        path.write_bytes(data)
+            path.write_bytes(data)
         return path
 
-    def load_evidence(self, evidence_hash: str) -> bytes:
-        """Load and decrypt evidence by hash prefix."""
+    def load_evidence(
+        self,
+        evidence_hash: str,
+        structure_context: dict | None = None,
+    ) -> bytes:
+        """Load and decrypt evidence by hash prefix.
+
+        Auto-detects format:
+          .v2.json → crypto_v2 AES-256-GCM decrypt
+          .enc     → legacy v1 Fernet decrypt
+          .bin     → plaintext legacy fallback
+        """
         evidence_dir = self.root / "evidence"
+        v2_path = evidence_dir / f"{evidence_hash[:16]}.v2.json"
         enc_path = evidence_dir / f"{evidence_hash[:16]}.enc"
         bin_path = evidence_dir / f"{evidence_hash[:16]}.bin"
-        if enc_path.exists():
+
+        if v2_path.exists():
+            if not self._v2_vault_salt or not self._v2_scrypt_salt:
+                raise ValueError(
+                    "Evidence is v2-encrypted but no vault_secret provided"
+                )
+            stored = json.loads(v2_path.read_text())
+            ciphertext = bytes.fromhex(stored["ciphertext_hex"])
+            envelope = EncryptedEnvelope.from_stored(stored, ciphertext)
+            ctx = structure_context or self._default_structure_context(evidence_hash)
+            return _v2_decrypt(
+                envelope,
+                self._vault_secret,
+                self._user_commitment,
+                self._v2_vault_salt,
+                self._v2_scrypt_salt,
+                ctx,
+            )
+        elif enc_path.exists():
+            # Legacy v1 Fernet
             if not self._vault_key:
                 raise ValueError(
-                "Evidence is encrypted but no vault_secret provided"
-            )
-            return decrypt_evidence(enc_path.read_bytes(), self._vault_key)
+                    "Evidence is v1-encrypted but no vault_secret provided"
+                )
+            return _fernet_decrypt(enc_path.read_bytes(), self._vault_key)
         elif bin_path.exists():
             return bin_path.read_bytes()
         else:

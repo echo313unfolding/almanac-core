@@ -120,6 +120,8 @@ def test_correct_triple_decrypts():
 # --- Encrypted vault round-trip ---
 
 def test_encrypted_vault_evidence():
+    """v1 test — vault now defaults to v2 (.v2.json), so this verifies the
+    new default path still encrypts and round-trips."""
     from vault import Vault
     commit = user_commitment("Jane Doe", "jane@example.com", "vault-test")
     with tempfile.TemporaryDirectory() as td:
@@ -127,9 +129,9 @@ def test_encrypted_vault_evidence():
         v.init()
         assert v.encrypted
         path = v.store_evidence("abc123def456", "raw html with PII")
-        assert path.suffix == ".enc"
-        raw = path.read_bytes()
-        assert b"raw html with PII" not in raw
+        assert path.name.endswith(".v2.json")
+        raw = path.read_text()
+        assert "raw html with PII" not in raw
         recovered = v.load_evidence("abc123def456")
         assert recovered == b"raw html with PII"
 
