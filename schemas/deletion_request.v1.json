@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "almanac.deletion_request.v1",
+  "title": "Deletion Request Receipt",
+  "description": "A deletion or opt-out request was submitted to a data broker.",
+  "type": "object",
+  "required": [
+    "schema", "receipt_id", "user_commitment", "broker_id",
+    "discovery_receipt_id", "request_type", "request_method",
+    "submitted_at", "evidence_hash", "raw_pii_stored"
+  ],
+  "properties": {
+    "schema": { "const": "almanac.deletion_request.v1" },
+    "receipt_id": { "type": "string" },
+    "user_commitment": { "type": "string" },
+    "service_id": { "type": "string" },
+    "broker_id": { "type": "string" },
+    "discovery_receipt_id": {
+      "type": "string",
+      "description": "Links back to the discovery receipt that triggered this request"
+    },
+    "request_type": {
+      "type": "string",
+      "enum": ["delete", "opt_out", "access", "correct"],
+      "description": "Type of data rights request"
+    },
+    "request_method": {
+      "type": "string",
+      "enum": ["api", "email", "webform", "portal", "postal", "phone", "drop"],
+      "description": "How the request was submitted"
+    },
+    "legal_basis": {
+      "type": "string",
+      "enum": ["ccpa", "gdpr", "delete_act", "vcdpa", "cpa", "ctdpa", "other", "none"],
+      "description": "Legal framework invoked (if any)"
+    },
+    "submitted_at": { "type": "string", "format": "date-time" },
+    "confirmation_id": {
+      "type": "string",
+      "description": "Broker-provided confirmation/ticket number (if any)"
+    },
+    "compliance_deadline": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Legal deadline for broker to respond (e.g. 45 days under CCPA)"
+    },
+    "evidence_hash": { "type": "string" },
+    "raw_pii_stored": { "const": false },
+    "previous_receipt_hash": { "type": "string" },
+    "notes": { "type": "string" }
+  },
+  "additionalProperties": false
+}

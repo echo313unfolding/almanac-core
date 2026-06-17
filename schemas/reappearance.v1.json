@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "almanac.reappearance.v1",
+  "title": "Reappearance Receipt",
+  "description": "A previously deleted record has reappeared at a broker.",
+  "type": "object",
+  "required": [
+    "schema", "receipt_id", "user_commitment", "broker_id",
+    "verification_receipt_id", "reappeared_at", "days_since_removal",
+    "evidence_hash", "raw_pii_stored"
+  ],
+  "properties": {
+    "schema": { "const": "almanac.reappearance.v1" },
+    "receipt_id": { "type": "string" },
+    "user_commitment": { "type": "string" },
+    "service_id": { "type": "string" },
+    "broker_id": { "type": "string" },
+    "verification_receipt_id": {
+      "type": "string",
+      "description": "Links to the verification receipt that last confirmed removal"
+    },
+    "original_discovery_receipt_id": {
+      "type": "string",
+      "description": "Links to the original discovery receipt"
+    },
+    "record_category": {
+      "type": "string",
+      "enum": [
+        "name_address", "phone_email", "employment", "education",
+        "financial", "social_media", "court_records", "property",
+        "relatives", "location_history", "purchase_history",
+        "search_history", "health", "biometric", "other"
+      ]
+    },
+    "reappeared_at": { "type": "string", "format": "date-time" },
+    "days_since_removal": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Days between confirmed removal and reappearance"
+    },
+    "likely_source": {
+      "type": "string",
+      "enum": ["same_broker", "data_sharing", "public_records", "unknown"],
+      "description": "Best guess at how the record reappeared"
+    },
+    "evidence_hash": { "type": "string" },
+    "raw_pii_stored": { "const": false },
+    "previous_receipt_hash": { "type": "string" },
+    "notes": { "type": "string" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "almanac.record_discovery.v1",
+  "title": "Record Discovery Receipt",
+  "description": "A privacy service found a record about a user at a data broker.",
+  "type": "object",
+  "required": [
+    "schema", "receipt_id", "user_commitment", "broker_id",
+    "record_category", "confidence", "evidence_hash",
+    "discovered_at", "raw_pii_stored"
+  ],
+  "properties": {
+    "schema": { "const": "almanac.record_discovery.v1" },
+    "receipt_id": {
+      "type": "string",
+      "description": "Unique receipt identifier (UUID)"
+    },
+    "user_commitment": {
+      "type": "string",
+      "description": "Hash of user identity claim. NOT the identity itself."
+    },
+    "service_id": {
+      "type": "string",
+      "description": "Which privacy service found this (e.g. deleteme, incogni, manual)"
+    },
+    "broker_id": {
+      "type": "string",
+      "description": "Normalized broker identifier (e.g. spokeo, whitepages, beenverified)"
+    },
+    "broker_url": {
+      "type": "string",
+      "description": "Broker site or profile URL (optional, may be redacted)"
+    },
+    "record_category": {
+      "type": "string",
+      "enum": [
+        "name_address", "phone_email", "employment", "education",
+        "financial", "social_media", "court_records", "property",
+        "relatives", "location_history", "purchase_history",
+        "search_history", "health", "biometric", "other"
+      ],
+      "description": "Category of data found. NOT the data itself."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Confidence that this record is actually about the user (0-1). Industry average is ~0.41."
+    },
+    "evidence_hash": {
+      "type": "string",
+      "description": "SHA-256 hash of the raw finding (screenshot, HTML, API response). Raw evidence stays local."
+    },
+    "discovered_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "raw_pii_stored": {
+      "const": false,
+      "description": "This receipt NEVER contains raw PII. Always false."
+    },
+    "previous_receipt_hash": {
+      "type": "string",
+      "description": "SHA-256 of previous receipt in chain (empty string for first receipt)"
+    },
+    "notes": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

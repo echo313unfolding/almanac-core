@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+*.log
+.DS_Store
+
+# Local user vaults / generated private state
+.almanac/
+vault/
+demo_vault/
+tmp/
+private/
+receipts/private/
+
+# Secrets / keys
+*.key
+*.pem
+*.p12
+*.pfx
+id.json
+*.secret

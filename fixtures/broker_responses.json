@@ -1,0 +1,68 @@
+{
+  "_comment": "Simulated broker responses to deletion requests. Covers the real spectrum: compliance, refusal, silence, partial, reappearance.",
+  "responses": {
+    "fastpeoplesearch": {
+      "status": "confirmed_deleted",
+      "days_to_respond": 3,
+      "method": "webform",
+      "evidence": "Email confirmation: 'Your profile has been removed. Please allow 24-48 hours for changes to propagate.'",
+      "verification_14d": {"still_present": false},
+      "verification_60d": {"still_present": false}
+    },
+    "spokeo": {
+      "status": "confirmed_deleted",
+      "days_to_respond": 7,
+      "method": "webform",
+      "evidence": "Opt-out confirmation page: 'Your information has been removed from Spokeo.'",
+      "verification_14d": {"still_present": false},
+      "verification_60d": {"still_present": true, "note": "Record reappeared after 45 days"}
+    },
+    "beenverified": {
+      "status": "partial",
+      "days_to_respond": 12,
+      "method": "email",
+      "evidence": "Email: 'We have removed your name and address. Employment records are sourced from public filings and cannot be removed.'",
+      "verification_14d": {"still_present": true, "note": "Employment data still visible"}
+    },
+    "whitepages": {
+      "status": "confirmed_deleted",
+      "days_to_respond": 5,
+      "method": "webform",
+      "evidence": "Profile page returns 404",
+      "note": "This was likely wrong person anyway (confidence 0.45)",
+      "verification_14d": {"still_present": false}
+    },
+    "intelius": {
+      "status": "no_response",
+      "days_to_respond": 45,
+      "method": "email",
+      "evidence": "No response after 45 days. CCPA deadline exceeded.",
+      "deadline_exceeded": true,
+      "verification_14d": {"still_present": true}
+    },
+    "radaris": {
+      "status": "rejected",
+      "days_to_respond": 8,
+      "method": "email",
+      "evidence": "Email: 'Court records are public information and exempt from deletion under the Fair Credit Reporting Act.'",
+      "rejection_reason": "exempt under FCRA",
+      "note": "This was likely wrong person anyway (confidence 0.35)"
+    },
+    "mylife": {
+      "status": "confirmed_deleted",
+      "days_to_respond": 14,
+      "method": "portal",
+      "evidence": "Portal status: 'Profile deactivated and scheduled for removal within 10 business days'",
+      "verification_14d": {"still_present": true, "note": "Still visible despite confirmation"},
+      "verification_30d": {"still_present": false}
+    },
+    "truepeoplesearch": {
+      "status": "confirmed_deleted",
+      "days_to_respond": 2,
+      "method": "webform",
+      "evidence": "Instant opt-out: 'Record removed'",
+      "verification_14d": {"still_present": false},
+      "verification_60d": {"still_present": false}
+    }
+  }
+}

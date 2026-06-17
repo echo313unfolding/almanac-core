@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "almanac.broker_response.v1",
+  "title": "Broker Response Receipt",
+  "description": "A data broker responded (or failed to respond) to a deletion request.",
+  "type": "object",
+  "required": [
+    "schema", "receipt_id", "user_commitment", "broker_id",
+    "request_receipt_id", "broker_status", "responded_at",
+    "evidence_hash", "raw_pii_stored"
+  ],
+  "properties": {
+    "schema": { "const": "almanac.broker_response.v1" },
+    "receipt_id": { "type": "string" },
+    "user_commitment": { "type": "string" },
+    "service_id": { "type": "string" },
+    "broker_id": { "type": "string" },
+    "request_receipt_id": {
+      "type": "string",
+      "description": "Links back to the deletion request receipt"
+    },
+    "broker_status": {
+      "type": "string",
+      "enum": [
+        "confirmed_deleted",
+        "rejected",
+        "no_response",
+        "partial",
+        "unverifiable",
+        "pending"
+      ]
+    },
+    "rejection_reason": {
+      "type": "string",
+      "description": "If rejected, why (e.g. 'exempt under FCRA', 'identity not verified')"
+    },
+    "responded_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When broker responded. For no_response, this is the check time."
+    },
+    "compliance_days": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Business days between request submission and response"
+    },
+    "deadline_exceeded": {
+      "type": "boolean",
+      "description": "True if broker responded after legal deadline"
+    },
+    "evidence_hash": { "type": "string" },
+    "raw_pii_stored": { "const": false },
+    "previous_receipt_hash": { "type": "string" },
+    "notes": { "type": "string" }
+  },
+  "additionalProperties": false
+}

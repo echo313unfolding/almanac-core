@@ -1,0 +1,77 @@
+{
+  "_comment": "Simulated privacy service scan report. Resembles output from DeleteMe/Incogni-style services. All names/addresses are fictional.",
+  "scan_date": "2026-06-15",
+  "service": "example_privacy_service",
+  "user_provided": {
+    "name": "Jordan Rivera",
+    "email": "j.rivera@example.com",
+    "state": "OH"
+  },
+  "brokers_scanned": 12,
+  "records_found": [
+    {
+      "broker": "fastpeoplesearch",
+      "record_type": "name_address",
+      "match_confidence": 0.92,
+      "details_summary": "Name, city, state, age range, possible relatives",
+      "broker_url": "https://fastpeoplesearch.example/profile/12345",
+      "raw_evidence": "HTML snapshot of profile page showing name=Jordan Rivera, city=Columbus, state=OH, age=30-35, relatives=2 listed"
+    },
+    {
+      "broker": "spokeo",
+      "record_type": "phone_email",
+      "match_confidence": 0.85,
+      "details_summary": "Phone number, email, social media links",
+      "broker_url": "https://spokeo.example/profile/67890",
+      "raw_evidence": "API response: {phone: '614-555-XXXX', email: 'j.rivera@example.com', social: ['linkedin']}"
+    },
+    {
+      "broker": "beenverified",
+      "record_type": "employment",
+      "match_confidence": 0.78,
+      "details_summary": "Employer name, job title, employment dates",
+      "broker_url": "https://beenverified.example/profile/24680",
+      "raw_evidence": "Screenshot showing employer=Midwest Utilities Corp, title=Fusion Technician, dates=2022-present"
+    },
+    {
+      "broker": "whitepages",
+      "record_type": "name_address",
+      "match_confidence": 0.45,
+      "details_summary": "Name and city match but different state — likely wrong person",
+      "broker_url": "https://whitepages.example/profile/11111",
+      "raw_evidence": "Profile: Jordan Rivera, Portland OR (user is in Columbus OH)"
+    },
+    {
+      "broker": "intelius",
+      "record_type": "relatives",
+      "match_confidence": 0.88,
+      "details_summary": "Possible relatives and associates listed",
+      "broker_url": "https://intelius.example/profile/33333",
+      "raw_evidence": "Relatives list: Maria Rivera, Carlos Rivera, David Chen"
+    },
+    {
+      "broker": "radaris",
+      "record_type": "court_records",
+      "match_confidence": 0.35,
+      "details_summary": "Traffic citation — different middle initial, probably wrong person",
+      "broker_url": "https://radaris.example/profile/44444",
+      "raw_evidence": "Court record: Jordan M. Rivera, traffic citation 2019 (user is Jordan L. Rivera)"
+    },
+    {
+      "broker": "mylife",
+      "record_type": "social_media",
+      "match_confidence": 0.70,
+      "details_summary": "Reputation score and social media aggregation",
+      "broker_url": "https://mylife.example/profile/55555",
+      "raw_evidence": "Profile aggregation: reputation score 3.8/5, linked accounts: facebook, linkedin"
+    },
+    {
+      "broker": "truepeoplesearch",
+      "record_type": "property",
+      "match_confidence": 0.82,
+      "details_summary": "Property records and address history",
+      "broker_url": "https://truepeoplesearch.example/profile/66666",
+      "raw_evidence": "Property: 1234 Maple St, Columbus OH, purchased 2023, assessed value $185K"
+    }
+  ]
+}

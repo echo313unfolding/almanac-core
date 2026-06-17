@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "almanac.verification.v1",
+  "title": "Verification Receipt",
+  "description": "Independent check whether a broker record was actually removed.",
+  "type": "object",
+  "required": [
+    "schema", "receipt_id", "user_commitment", "broker_id",
+    "response_receipt_id", "verification_method", "record_still_present",
+    "verified_at", "evidence_hash", "raw_pii_stored"
+  ],
+  "properties": {
+    "schema": { "const": "almanac.verification.v1" },
+    "receipt_id": { "type": "string" },
+    "user_commitment": { "type": "string" },
+    "service_id": { "type": "string" },
+    "broker_id": { "type": "string" },
+    "response_receipt_id": {
+      "type": "string",
+      "description": "Links back to the broker response receipt"
+    },
+    "verification_method": {
+      "type": "string",
+      "enum": ["re_search", "api_check", "manual_check", "automated_scan", "user_reported"],
+      "description": "How the verification was performed"
+    },
+    "record_still_present": {
+      "type": "boolean",
+      "description": "True = record is still there despite claimed deletion. False = confirmed gone."
+    },
+    "verified_at": { "type": "string", "format": "date-time" },
+    "days_since_deletion": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Days between broker's claimed deletion and this verification"
+    },
+    "evidence_hash": { "type": "string" },
+    "raw_pii_stored": { "const": false },
+    "previous_receipt_hash": { "type": "string" },
+    "notes": { "type": "string" }
+  },
+  "additionalProperties": false
+}
