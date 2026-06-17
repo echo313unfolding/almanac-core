@@ -5,11 +5,11 @@ Open receipt protocol for personal data-rights infrastructure.
 ## Audit Gate
 
 ```text
-Almanac Core receipt protocol: 144/144 PASS
+Almanac Core receipt protocol: 160/160 PASS
   test_receipts:   27 (schemas, chain, vault, demo)
   test_crypto:     14 (v1 key derivation, Fernet encrypt/decrypt, vault encryption)
   test_crypto_v2:  31 (structure binding, AES-256-GCM, KEK/DEK, AAD, DEK wrap AAD)
-  test_vault_v2:   53 (vault integration, signing, verified migration, transactional rotation, HMAC index, downgrade)
+  test_vault_v2:   69 (vault integration, signing, migration, rotation, HMAC index, downgrade, security state, atomic writes)
   test_safety:     19 (risk scoring, cohort gates, contextual adjustments)
 ```
 
@@ -83,6 +83,24 @@ Almanac Core receipt protocol: 144/144 PASS
 * Pre-signing receipts (no index entry) load without error.
 * Rotation re-signs index HMAC with new signing key.
 * Signed receipt index and HMAC written with 0600 permissions.
+* Atomic file writes: 0600 permissions from birth (no TOCTOU window).
+* Atomic write uses os.open(O_CREAT|O_TRUNC, 0600) + fsync + os.replace.
+* No .atomictmp files remain after successful write.
+* VAULT_SECURITY_STATE.json created on encrypted vault init (integrity marker).
+* Security state is HMAC-protected (tamper detected).
+* Security state deletion detected on re-open (when signed index exists).
+* legacy_upgrade=True bypasses security state deletion check (v0.3.5 upgrade path).
+* Security state init creates empty signed index (deletion detectable from first open).
+* Signed index deletion detected when security state is active.
+* Signed index HMAC deletion detected (raises when signing key exists).
+* Wrong vault_secret detected at init via security state HMAC (early fail-closed).
+* Wrong-secret rotation recovery blocked (decrypt verification before re-signing).
+* Rotation recovery re-signs security state + index + receipts with post-rotation key.
+* Receipt filename collision detected (rid[:8] clash → falls back to rid[:16]).
+* Receipt store uses atomic write (0600 from birth).
+* Security epoch increments on key rotation.
+* Security state + HMAC written with 0600 permissions.
+* Unencrypted vaults do not create security state.
 * PII risk scoring across 15 record categories (6 dimensions).
 * High-risk categories (SSN, health, mugshot) correctly blocked.
 * Cohort safety gate enforces minimums (50 default, 100 sensitive).
@@ -118,7 +136,9 @@ capsule boundaries, and policy-gated access.
 ```text
 v0.2: Encrypted local vault with structure-bound keys (Fernet MVP)
 v0.3: AES-256-GCM + AAD + scrypt-n17/HKDF + structure-bound envelope + passphrase gate
-v0.3.5: Verified migration, transactional rotation, HMAC sidecar deletion detection  ← current
+v0.3.5: Verified migration, transactional rotation, HMAC sidecar deletion detection
+v0.3.6: Atomic writes, security state marker, wrong-secret recovery guard, collision detection  ← current
+v0.3.7: External checkpoint / rollback detection
 v0.4: PQ-ready interfaces (ML-KEM/ML-DSA/SLH-DSA type stubs)
 v1.0: ML-KEM/ML-DSA/SLH-DSA wired and tested
 ```

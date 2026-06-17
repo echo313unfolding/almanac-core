@@ -92,12 +92,13 @@ def test_v2_wrong_secret_fails():
         v1 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
         v1.init()
         v1.store_evidence("a1b2c3d4e5f60000", "secret data")
+        # v0.3.6: wrong secret now fails at init (security state HMAC check)
         v2 = Vault(td, user_commitment=COMMIT, vault_secret="wrong-secret")
-        v2.init()
         try:
+            v2.init()
             v2.load_evidence("a1b2c3d4e5f60000")
             assert False, "Wrong secret must fail"
-        except Exception:
+        except (ValueError, Exception):
             pass
 
 
@@ -495,13 +496,13 @@ def test_rotate_secret_re_encrypts_evidence():
         result = v.rotate_secret(new_secret)
         assert result["evidence_rotated"] == 2
 
-        # Old secret cannot decrypt
+        # Old secret cannot even open vault (security state HMAC mismatch)
         v_old = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
-        v_old.init()
         try:
+            v_old.init()
             v_old.load_evidence("a1b2c3d4e5f60000")
             assert False, "Old secret must fail after rotation"
-        except Exception:
+        except (ValueError, Exception):
             pass
 
         # New secret decrypts
@@ -995,3 +996,322 @@ def test_signed_index_is_0600():
         index_path = Path(td) / "signed_receipts.json"
         assert _file_mode(index_path) == 0o600
         assert _file_mode(index_path.with_suffix(".hmac")) == 0o600
+
+
+# ── v0.3.6: Atomic writes + TOCTOU fix ──────────────────────────────────
+
+def test_atomic_write_creates_0600_from_birth():
+    """Files created via _secure_write_text are 0600 from the start (no TOCTOU)."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        # Salt files are created by _secure_write_text during init
+        from crypto_v2 import VAULT_SALT_FILE, SCRYPT_SALT_FILE
+        for name in [VAULT_SALT_FILE, SCRYPT_SALT_FILE]:
+            p = Path(td) / name
+            assert p.exists()
+            mode = _file_mode(p)
+            assert mode == 0o600, f"{name} has mode {oct(mode)}, expected 0o600"
+        # No .atomictmp files left behind
+        assert len(list(Path(td).glob("*.atomictmp"))) == 0
+
+
+def test_no_atomictmp_files_remain():
+    """Atomic writes must not leave .atomictmp files on success."""
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        v.store_evidence("a1b2c3d4e5f60000", "data")
+        r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        v.store(r)
+        # Check everywhere for leftover temp files
+        for tmp in Path(td).rglob("*.atomictmp"):
+            assert False, f"Leftover temp file: {tmp}"
+
+
+# ── v0.3.6: Security state ────────────────────────────────────────────
+
+def test_security_state_created_on_init():
+    """Encrypted vault init creates VAULT_SECURITY_STATE.json."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        state_path = Path(td) / "VAULT_SECURITY_STATE.json"
+        assert state_path.exists()
+        state = json.loads(state_path.read_text())
+        assert state["security_epoch"] == 0
+        assert "vault_id" in state
+        assert "created_at" in state
+
+
+def test_security_state_is_hmac_protected():
+    """VAULT_SECURITY_STATE.json has an HMAC sidecar."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        state_path = Path(td) / "VAULT_SECURITY_STATE.json"
+        hmac_path = state_path.with_suffix(".hmac")
+        assert hmac_path.exists()
+        assert len(hmac_path.read_text().strip()) == 64
+
+
+def test_security_state_is_0600():
+    """Security state and its HMAC have 0600 permissions."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        state_path = Path(td) / "VAULT_SECURITY_STATE.json"
+        assert _file_mode(state_path) == 0o600
+        assert _file_mode(state_path.with_suffix(".hmac")) == 0o600
+
+
+def test_security_state_tamper_detected():
+    """Tampered VAULT_SECURITY_STATE.json raises on vault open."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        # Tamper with security state
+        state_path = Path(td) / "VAULT_SECURITY_STATE.json"
+        state_path.write_text('{"security_epoch": 999, "tampered": true}\n')
+        try:
+            v2 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+            v2.init()
+            assert False, "Tampered security state must raise"
+        except ValueError as e:
+            assert "tampered" in str(e).lower()
+
+
+def test_security_state_deletion_detected():
+    """Deleting VAULT_SECURITY_STATE.json raises on re-open (when index exists)."""
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        v.store(r)
+
+        # Delete security state (but signed index remains)
+        state_path = Path(td) / "VAULT_SECURITY_STATE.json"
+        state_path.unlink()
+        state_path.with_suffix(".hmac").unlink()
+
+        try:
+            v2 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+            v2.init()
+            assert False, "Missing security state with existing index must raise"
+        except ValueError as e:
+            assert "missing" in str(e).lower()
+
+
+def test_security_state_deletion_bypassed_with_legacy_upgrade():
+    """legacy_upgrade=True allows upgrading from v0.3.5 (no security state)."""
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        v.store(r)
+
+        # Simulate v0.3.5 vault (has index, no security state)
+        state_path = Path(td) / "VAULT_SECURITY_STATE.json"
+        state_path.unlink()
+        state_path.with_suffix(".hmac").unlink()
+
+        # legacy_upgrade=True allows opening
+        v2 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET,
+                    legacy_upgrade=True)
+        v2.init()
+        assert v2.encrypted
+        # Security state should now exist
+        assert state_path.exists()
+
+
+def test_security_state_creates_empty_signed_index():
+    """Security state init creates an empty signed index if none exists."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        index_path = Path(td) / "signed_receipts.json"
+        assert index_path.exists()
+        assert json.loads(index_path.read_text()) == []
+        assert index_path.with_suffix(".hmac").exists()
+
+
+# ── v0.3.6: Signed index deletion detection (hardened) ──────────────────
+
+def test_signed_index_deletion_detected_with_security_state():
+    """Deleting signed_receipts.json + its HMAC raises when security state active."""
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        path = v.store(r)
+
+        # Attacker deletes index + index HMAC + receipt HMAC
+        index_path = Path(td) / "signed_receipts.json"
+        index_path.unlink()
+        index_path.with_suffix(".hmac").unlink()
+        path.with_suffix(".hmac").unlink()
+
+        # Security state still exists → index deletion detected
+        try:
+            v.load_receipt(path)
+            assert False, "Index deletion must be detected"
+        except ValueError as e:
+            assert "index deletion" in str(e).lower() or "missing" in str(e).lower()
+
+
+def test_signed_index_hmac_deletion_detected():
+    """Deleting only the index HMAC raises on load."""
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        path = v.store(r)
+
+        # Delete just the index HMAC
+        index_hmac = Path(td) / "signed_receipts.hmac"
+        index_hmac.unlink()
+        # Delete receipt HMAC to force index lookup path
+        path.with_suffix(".hmac").unlink()
+
+        try:
+            v.load_receipt(path)
+            assert False, "Missing index HMAC must raise"
+        except ValueError as e:
+            assert "hmac" in str(e).lower()
+
+
+# ── v0.3.6: Wrong-secret rotation recovery ─────────────────────────────
+
+def test_wrong_secret_rotation_recovery_blocked():
+    """Opening with pre-rotation secret after committed rotation raises."""
+    from crypto_v2 import encrypt_evidence as v2_encrypt, generate_salt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        v.store_evidence("a1b2c3d4e5f60000", "recovery test")
+
+        # Simulate committed rotation to new_secret
+        new_secret = "rotated-passphrase-2026"
+        new_scrypt_salt = generate_salt()
+        evidence_dir = Path(td) / "evidence"
+
+        # Re-encrypt evidence with new secret
+        plaintext = v.load_evidence("a1b2c3d4e5f60000")
+        ctx = v._default_structure_context("a1b2c3d4e5f60000")
+        envelope = v2_encrypt(
+            plaintext, new_secret, COMMIT,
+            v._v2_vault_salt, new_scrypt_salt, ctx,
+        )
+        stored = envelope.to_dict()
+        stored["ciphertext_hex"] = envelope.ciphertext.hex()
+        rotating = evidence_dir / "a1b2c3d4e5f60000.v2.json.rotating"
+        rotating.write_text(json.dumps(stored, indent=2) + "\n")
+
+        # Write committed journal
+        journal = {
+            "phase": "committed",
+            "started_at": "2026-06-17T00:00:00Z",
+            "new_scrypt_salt_hex": new_scrypt_salt.hex(),
+            "evidence_hashes": ["a1b2c3d4e5f60000"],
+        }
+        (Path(td) / "rotation_journal.json").write_text(
+            json.dumps(journal) + "\n"
+        )
+
+        # Open with OLD secret — must fail
+        try:
+            v_old = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+            v_old.init()
+            assert False, "Wrong secret during recovery must raise"
+        except ValueError as e:
+            assert "rotation recovery failed" in str(e).lower()
+
+        # Journal should still exist (recovery not completed)
+        assert (Path(td) / "rotation_journal.json").exists()
+
+        # Open with CORRECT secret — recovery completes
+        v_new = Vault(td, user_commitment=COMMIT, vault_secret=new_secret)
+        v_new.init()
+        assert v_new.load_evidence("a1b2c3d4e5f60000") == b"recovery test"
+        assert not (Path(td) / "rotation_journal.json").exists()
+
+
+# ── v0.3.6: Receipt filename collision ──────────────────────────────────
+
+def test_receipt_filename_collision_uses_longer_prefix():
+    """Two receipts with same rid[:8] but different IDs use longer prefix."""
+    from receipts import discovery_receipt
+    import uuid
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+
+        # Create two receipts with IDs that share first 8 chars
+        r1 = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        # Force a colliding prefix by manipulating receipt_id
+        r1["receipt_id"] = "AABBCCDD-1111-1111-1111-111111111111"
+        r2 = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.8, "evidence")
+        r2["receipt_id"] = "AABBCCDD-2222-2222-2222-222222222222"
+
+        path1 = v.store(r1)
+        path2 = v.store(r2)
+
+        # First uses short prefix, second uses longer prefix
+        assert "AABBCCDD" in path1.name
+        assert path1 != path2
+        assert path2.name != path1.name
+
+        # Both must load correctly
+        loaded1 = v.load_receipt(path1)
+        loaded2 = v.load_receipt(path2)
+        assert loaded1["receipt_id"] == r1["receipt_id"]
+        assert loaded2["receipt_id"] == r2["receipt_id"]
+
+
+def test_receipt_store_is_atomic():
+    """Receipt store uses atomic write (0600 from birth)."""
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        path = v.store(r)
+        assert _file_mode(path) == 0o600
+
+
+# ── v0.3.6: Security state epoch on rotation ────────────────────────────
+
+def test_security_state_epoch_bumps_on_rotation():
+    """rotate_secret increments security_epoch in VAULT_SECURITY_STATE.json."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        v.store_evidence("a1b2c3d4e5f60000", "epoch test")
+
+        state_path = Path(td) / "VAULT_SECURITY_STATE.json"
+        pre = json.loads(state_path.read_text())
+        assert pre["security_epoch"] == 0
+
+        v.rotate_secret("rotated-passphrase-2026")
+
+        post = json.loads(state_path.read_text())
+        assert post["security_epoch"] == 1
+        assert "last_rotation" in post
+
+        # HMAC is valid after rotation
+        v2 = Vault(td, user_commitment=COMMIT, vault_secret="rotated-passphrase-2026")
+        v2.init()
+        assert v2.load_evidence("a1b2c3d4e5f60000") == b"epoch test"
+
+
+def test_unencrypted_vault_has_no_security_state():
+    """Unencrypted vaults do not create security state."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td)
+        v.init()
+        assert not (Path(td) / "VAULT_SECURITY_STATE.json").exists()

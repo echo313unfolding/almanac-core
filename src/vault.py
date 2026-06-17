@@ -20,19 +20,56 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 # Owner read/write only — no group, no other
-_FILE_MODE = stat.S_IRUSR | stat.S_IWUSR  # 0o600
+_FILE_MODE = 0o600
+_OPEN_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+
+
+def _fsync_dir(dir_path: Path) -> None:
+    """Best-effort fsync of directory for rename durability."""
+    try:
+        fd = os.open(str(dir_path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def _secure_write_text(path: Path, content: str) -> None:
-    """Write text and set 0600 permissions."""
-    path.write_text(content)
-    path.chmod(_FILE_MODE)
+    """Atomic write text: create 0600 from birth, fsync, rename.
+
+    File is never world-readable — permissions are set at os.open time,
+    not after write (no TOCTOU window).
+    """
+    tmp = path.parent / (path.name + ".atomictmp")
+    fd = os.open(str(tmp), _OPEN_FLAGS, _FILE_MODE)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(str(tmp), str(path))
+    _fsync_dir(path.parent)
 
 
 def _secure_write_bytes(path: Path, content: bytes) -> None:
-    """Write bytes and set 0600 permissions."""
-    path.write_bytes(content)
-    path.chmod(_FILE_MODE)
+    """Atomic write bytes: create 0600 from birth, fsync, rename."""
+    tmp = path.parent / (path.name + ".atomictmp")
+    fd = os.open(str(tmp), _OPEN_FLAGS, _FILE_MODE)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(str(tmp), str(path))
+    _fsync_dir(path.parent)
 
 try:
     from .receipts import receipt_hash, validate_receipt
@@ -99,6 +136,7 @@ SCHEMA_TO_SUBDIR = {
 
 ROTATION_JOURNAL = "rotation_journal.json"
 SIGNED_RECEIPTS_INDEX = "signed_receipts.json"
+SECURITY_STATE_FILE = "VAULT_SECURITY_STATE.json"
 
 
 def _write_journal(path: Path, data: dict) -> None:
@@ -128,10 +166,12 @@ class Vault:
         root: Path | str | None = None,
         user_commitment: str = "",
         vault_secret: str = "",
+        legacy_upgrade: bool = False,
     ):
         self.root = Path(root) if root else DEFAULT_VAULT
         self._user_commitment = user_commitment
         self._vault_secret = vault_secret
+        self._legacy_upgrade = legacy_upgrade
         # v1 legacy key (Fernet)
         self._vault_key: bytes | None = None
         # v2 salts (AES-256-GCM)
@@ -140,6 +180,8 @@ class Vault:
         self._vault_id: str = ""
         # HMAC signing key (derived independently from KEK)
         self._signing_key: bytes | None = None
+        # Security state (set by _init_security_state)
+        self._security_state: dict | None = None
 
     def init(self) -> Path:
         """Create vault directory structure. Idempotent.
@@ -179,6 +221,7 @@ class Vault:
             self._init_v2_encryption()
             self._init_signing_key()
             self._finish_rotation_recovery()  # Stage 2: post-crypto re-sign
+            self._init_security_state()       # Stage 3: integrity marker
             self._migrate_v1_to_v2()
         return self.root
 
@@ -220,6 +263,60 @@ class Vault:
             self._v2_vault_salt,
             self._v2_scrypt_salt,
         )
+
+    def _init_security_state(self):
+        """Initialize or verify vault security state marker.
+
+        VAULT_SECURITY_STATE.json is HMAC-protected and makes silent deletion
+        of the signed receipt index detectable. Created on first encrypted
+        vault init; required on every subsequent open.
+        """
+        state_path = self.root / SECURITY_STATE_FILE
+        hmac_path = state_path.with_suffix(".hmac")
+
+        if state_path.exists():
+            # Verify HMAC
+            if self._signing_key and hmac_path.exists():
+                data = state_path.read_bytes()
+                expected = hmac_path.read_text().strip()
+                if not verify_hmac(data, self._signing_key, expected):
+                    raise ValueError(
+                        "VAULT_SECURITY_STATE.json HMAC verification failed — "
+                        "either the file was tampered with or the vault_secret "
+                        "is wrong"
+                    )
+            self._security_state = json.loads(state_path.read_text())
+            return
+
+        # Security state missing — check for deletion attack
+        index_path = self.root / SIGNED_RECEIPTS_INDEX
+        if index_path.exists() and not self._legacy_upgrade:
+            raise ValueError(
+                "VAULT_SECURITY_STATE.json is missing but signed_receipts.json "
+                "exists. Possible integrity attack — the security state file "
+                "may have been deleted. Use legacy_upgrade=True if upgrading "
+                "from v0.3.5."
+            )
+
+        # Create fresh security state
+        self._security_state = {
+            "security_epoch": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "vault_id": self._vault_id,
+        }
+        self._save_security_state()
+        # Ensure signed index exists so deletion is detectable
+        if not index_path.exists():
+            self._save_signed_index(set())
+
+    def _save_security_state(self):
+        """Write security state + HMAC sidecar."""
+        state_path = self.root / SECURITY_STATE_FILE
+        content = json.dumps(self._security_state, indent=2) + "\n"
+        _secure_write_text(state_path, content)
+        if self._signing_key:
+            mac = compute_hmac(content.encode(), self._signing_key)
+            _secure_write_text(state_path.with_suffix(".hmac"), mac + "\n")
 
     def _recover_rotation(self):
         """Stage 1 rotation recovery: fix disk state before crypto init.
@@ -265,23 +362,73 @@ class Vault:
         journal_path.unlink()
 
     def _finish_rotation_recovery(self):
-        """Stage 2 rotation recovery: re-sign receipts after crypto is initialized."""
+        """Stage 2 rotation recovery: re-sign receipts after crypto is initialized.
+
+        Verifies the current vault_secret can decrypt evidence before
+        re-signing. If opened with the wrong (pre-rotation) secret,
+        raises instead of silently corrupting HMAC integrity.
+        """
         journal_path = self.root / ROTATION_JOURNAL
         if not journal_path.exists():
             return
         journal = json.loads(journal_path.read_text())
         if journal.get("phase") in ("committed", "salt_updated"):
+            # Verify current secret can actually decrypt evidence
+            evidence_dir = self.root / "evidence"
+            if evidence_dir.exists():
+                v2_files = sorted(evidence_dir.glob("*.v2.json"))
+                if v2_files:
+                    test_path = v2_files[0]
+                    evidence_hash = test_path.name.replace(".v2.json", "")
+                    try:
+                        self.load_evidence(evidence_hash)
+                    except Exception:
+                        raise ValueError(
+                            "Rotation recovery failed: cannot decrypt evidence "
+                            "with current vault_secret. Open the vault with "
+                            "the correct post-rotation secret to complete "
+                            "recovery."
+                        )
+
+            # Re-sign index HMAC first (old HMAC is from pre-rotation key)
+            index_path = self.root / SIGNED_RECEIPTS_INDEX
+            if index_path.exists():
+                raw_entries = set(json.loads(index_path.read_text()))
+                self._save_signed_index(raw_entries)
+
+            # Re-sign all receipts with new signing key
             for receipt_path in self.list_receipts():
                 self._sign_receipt(receipt_path)
+
+            # Re-sign security state (its HMAC is from the pre-rotation key)
+            state_path = self.root / SECURITY_STATE_FILE
+            if state_path.exists() and self._signing_key:
+                state_data = state_path.read_bytes()
+                mac = compute_hmac(state_data, self._signing_key)
+                _secure_write_text(state_path.with_suffix(".hmac"), mac + "\n")
+
             journal_path.unlink()
 
     def _load_signed_index(self) -> set:
-        """Load the signed receipt index, verifying its HMAC."""
+        """Load the signed receipt index, verifying its HMAC.
+
+        When security state is active, the index MUST exist.
+        When a signing key exists, the index HMAC MUST exist and verify.
+        """
         path = self.root / SIGNED_RECEIPTS_INDEX
         if not path.exists():
+            if self._security_state is not None:
+                raise ValueError(
+                    "Signed receipt index missing but vault security state "
+                    "is active — possible index deletion attack"
+                )
             return set()
         hmac_path = path.with_suffix(".hmac")
-        if self._signing_key and hmac_path.exists():
+        if self._signing_key:
+            if not hmac_path.exists():
+                raise ValueError(
+                    "Signed receipt index HMAC missing — possible tampering"
+                )
             expected = hmac_path.read_text().strip()
             data = path.read_bytes()
             if not verify_hmac(data, self._signing_key, expected):
@@ -439,7 +586,11 @@ class Vault:
         return ctx
 
     def store(self, receipt: dict) -> Path:
-        """Validate and store a receipt. Returns the file path."""
+        """Validate and store a receipt. Returns the file path.
+
+        Atomic write (0600 from birth). Detects receipt_id collisions on
+        the truncated filename and falls back to a longer prefix.
+        """
         errors = validate_receipt(receipt)
         if errors:
             raise ValueError(f"Invalid receipt: {errors}")
@@ -457,7 +608,14 @@ class Vault:
         fname = f"{broker}_{rid[:8]}.json"
         path = target_dir / fname
 
-        path.write_text(json.dumps(receipt, indent=2) + "\n")
+        # Collision detection: existing file with different receipt_id
+        if path.exists():
+            existing = json.loads(path.read_text())
+            if existing.get("receipt_id") != rid:
+                fname = f"{broker}_{rid[:16]}.json"
+                path = target_dir / fname
+
+        _secure_write_text(path, json.dumps(receipt, indent=2) + "\n")
         self._sign_receipt(path)
         return path
 
@@ -724,6 +882,16 @@ class Vault:
         for receipt_path in self.list_receipts():
             self._sign_receipt(receipt_path)
             receipts_signed += 1
+
+        # Phase 8.5: Update security state epoch
+        if self._security_state is not None:
+            self._security_state["security_epoch"] = (
+                self._security_state.get("security_epoch", 0) + 1
+            )
+            self._security_state["last_rotation"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+            self._save_security_state()
 
         # Phase 9: Clean up journal
         journal_path.unlink()

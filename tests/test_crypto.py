@@ -164,13 +164,14 @@ def test_encrypted_vault_wrong_secret_fails():
         v1 = Vault(td, user_commitment=commit, vault_secret="correct-secret")
         v1.init()
         v1.store_evidence("abc123def456", "secret stuff")
-        # Same commitment, wrong secret
+        # Same commitment, wrong secret — vault refuses to open (HMAC check)
         v2 = Vault(td, user_commitment=commit, vault_secret="wrong-secret")
-        v2.init()
         try:
+            v2.init()
+            # If init somehow passes, evidence must still fail
             v2.load_evidence("abc123def456")
             assert False, "Should have raised"
-        except Exception:
+        except (ValueError, Exception):
             pass
 
 def test_encrypted_vault_salt_persists():
