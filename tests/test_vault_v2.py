@@ -230,6 +230,7 @@ def test_v2_salts_persist_across_reopens():
         assert ss_path.exists()
         salt1 = vs_path.read_text().strip()
         scrypt1 = ss_path.read_text().strip()
+        v1.close()
 
         # Reopen vault with same credentials
         v2 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
@@ -248,6 +249,7 @@ def test_v2_vault_id_derived_from_salt():
         v.init()
         assert len(v.vault_id) == 16
         assert v.vault_id  # non-empty
+        v.close()
 
         # Reopen — same vault_id
         v2 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
@@ -307,6 +309,7 @@ def test_v2_encrypted_but_no_secret_on_load_raises():
         v1 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
         v1.init()
         v1.store_evidence("a1b2c3d4e5f60000", "encrypted data")
+        v1.close()
 
         # Reopen without secret
         v2 = Vault(td)
@@ -472,6 +475,7 @@ def test_v1_migration_skips_already_migrated():
 
         # Plant a new .enc with same hash (simulate partial previous migration)
         enc_path.write_bytes(fernet_encrypt(b"old data", v1_key))
+        v.close()
 
         # Second init — .v2.json is valid, should just archive .enc
         v2 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
@@ -495,6 +499,7 @@ def test_rotate_secret_re_encrypts_evidence():
         new_secret = "rotated-passphrase-2026"
         result = v.rotate_secret(new_secret)
         assert result["evidence_rotated"] == 2
+        v.close()
 
         # Old secret cannot even open vault (security state HMAC mismatch)
         v_old = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
@@ -527,6 +532,7 @@ def test_rotate_secret_re_signs_receipts():
 
         new_hmac = path.with_suffix(".hmac").read_text().strip()
         assert new_hmac != old_hmac  # different signing key = different HMAC
+        v.close()
 
         # New vault verifies the new HMAC
         v_new = Vault(td, user_commitment=COMMIT, vault_secret=new_secret)
@@ -686,6 +692,7 @@ def test_migration_enc_migrated_not_remigrated():
 
         migrated = evidence_dir / "a1b2c3d4e5f60000.enc.migrated"
         assert migrated.exists()
+        v.close()
 
         # Second init — .enc.migrated must not be picked up
         v2 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
@@ -710,6 +717,7 @@ def test_rotation_writes_journal():
 
         # Journal should be deleted after successful rotation
         assert not journal_path.exists()
+        v.close()
         # Evidence still works
         v2 = Vault(td, user_commitment=COMMIT, vault_secret="new-strong-secret-2026")
         v2.init()
@@ -791,6 +799,7 @@ def test_rotation_recovery_pre_commit_rollback():
         # Create orphaned .rotating file
         orphan = evidence_dir / "a1b2c3d4e5f60000.v2.json.rotating"
         orphan.write_text('{"fake":"rotating"}\n')
+        v.close()
 
         # Re-open vault — should rollback
         v2 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
@@ -844,6 +853,7 @@ def test_rotation_recovery_post_commit():
         }
         journal_path = Path(td) / "rotation_journal.json"
         journal_path.write_text(json.dumps(journal) + "\n")
+        v.close()
 
         # Re-open with NEW secret — recovery should complete
         v2 = Vault(td, user_commitment=COMMIT, vault_secret=new_secret)
@@ -952,6 +962,7 @@ def test_pre_signing_receipt_loads_in_encrypted_vault():
         v1.init()
         r = discovery_receipt("c", "spokeo", "phone_email", 0.9, "evidence")
         path = v1.store(r)
+        v1.close()
 
         # Now open vault with encryption — receipt has no HMAC and no index entry
         v2 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
@@ -971,6 +982,7 @@ def test_rotation_updates_signed_index():
 
         new_secret = "rotated-passphrase-2026"
         v.rotate_secret(new_secret)
+        v.close()
 
         # Reopen with new secret — index should be verifiable
         v2 = Vault(td, user_commitment=COMMIT, vault_secret=new_secret)
@@ -1074,6 +1086,7 @@ def test_security_state_tamper_detected():
         # Tamper with security state
         state_path = Path(td) / "VAULT_SECURITY_STATE.json"
         state_path.write_text('{"security_epoch": 999, "tampered": true}\n')
+        v.close()
         try:
             v2 = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
             v2.init()
@@ -1090,6 +1103,7 @@ def test_security_state_deletion_detected():
         v.init()
         r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
         v.store(r)
+        v.close()
 
         # Delete security state (but signed index remains)
         state_path = Path(td) / "VAULT_SECURITY_STATE.json"
@@ -1113,6 +1127,7 @@ def test_security_state_deletion_bypassed_with_legacy_upgrade():
         r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
         v.store(r)
 
+        v.close()
         # Simulate v0.3.5 vault (has index, no security state)
         state_path = Path(td) / "VAULT_SECURITY_STATE.json"
         state_path.unlink()
@@ -1222,6 +1237,7 @@ def test_wrong_secret_rotation_recovery_blocked():
         (Path(td) / "rotation_journal.json").write_text(
             json.dumps(journal) + "\n"
         )
+        v.close()
 
         # Open with OLD secret — must fail
         try:
@@ -1302,6 +1318,7 @@ def test_security_state_epoch_bumps_on_rotation():
         post = json.loads(state_path.read_text())
         assert post["security_epoch"] == 1
         assert "last_rotation" in post
+        v.close()
 
         # HMAC is valid after rotation
         v2 = Vault(td, user_commitment=COMMIT, vault_secret="rotated-passphrase-2026")

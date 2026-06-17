@@ -12,6 +12,7 @@ Receipts are portable and plaintext (they contain no PII by schema design).
 The vault_secret must never be committed, exported, or stored in the vault.
 """
 
+import fcntl
 import hashlib
 import json
 import os
@@ -137,6 +138,9 @@ SCHEMA_TO_SUBDIR = {
 ROTATION_JOURNAL = "rotation_journal.json"
 SIGNED_RECEIPTS_INDEX = "signed_receipts.json"
 SECURITY_STATE_FILE = "VAULT_SECURITY_STATE.json"
+VAULT_LOCK_FILE = ".vault.lock"
+CHECKPOINT_FILE = "CHECKPOINT.json"
+CHECKPOINT_ROOT_FILE = "CHECKPOINT_ROOT.txt"
 
 
 def _write_journal(path: Path, data: dict) -> None:
@@ -182,6 +186,42 @@ class Vault:
         self._signing_key: bytes | None = None
         # Security state (set by _init_security_state)
         self._security_state: dict | None = None
+        # Vault lock fd (set by _acquire_lock)
+        self._lock_fd: int | None = None
+
+    def _acquire_lock(self) -> None:
+        """Acquire exclusive flock on the vault. Raises if already held."""
+        lock_path = self.root / VAULT_LOCK_FILE
+        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, _FILE_MODE)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise ValueError(
+                "Vault is locked by another process. "
+                "Close the other vault instance or wait."
+            )
+        self._lock_fd = fd
+
+    def _release_lock(self) -> None:
+        """Release vault lock."""
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                os.close(self._lock_fd)
+            except OSError:
+                pass
+            self._lock_fd = None
+
+    def close(self) -> None:
+        """Release vault lock and resources."""
+        self._release_lock()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     def init(self) -> Path:
         """Create vault directory structure. Idempotent.
@@ -205,24 +245,31 @@ class Vault:
                     f"Weak vault_secret: {'; '.join(errors)}"
                 )
 
-        for sub in SUBDIRS:
-            (self.root / sub).mkdir(parents=True, exist_ok=True)
-        manifest = self.root / "MANIFEST.md"
-        if not manifest.exists():
-            manifest.write_text(
-                "# Almanac Vault\n\n"
-                "This directory contains your personal data rights receipts.\n"
-                "You own this data. It never leaves your machine unless you export it.\n\n"
-                f"Created: {datetime.now(timezone.utc).isoformat()}\n"
-            )
-        if self._vault_secret and self._user_commitment:
-            self._recover_rotation()          # Stage 1: pre-crypto disk recovery
-            self._init_v1_encryption()
-            self._init_v2_encryption()
-            self._init_signing_key()
-            self._finish_rotation_recovery()  # Stage 2: post-crypto re-sign
-            self._init_security_state()       # Stage 3: integrity marker
-            self._migrate_v1_to_v2()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._acquire_lock()
+        try:
+            for sub in SUBDIRS:
+                (self.root / sub).mkdir(parents=True, exist_ok=True)
+            manifest = self.root / "MANIFEST.md"
+            if not manifest.exists():
+                manifest.write_text(
+                    "# Almanac Vault\n\n"
+                    "This directory contains your personal data rights receipts.\n"
+                    "You own this data. It never leaves your machine unless you export it.\n\n"
+                    f"Created: {datetime.now(timezone.utc).isoformat()}\n"
+                )
+            if self._vault_secret and self._user_commitment:
+                self._recover_rotation()          # Stage 1: pre-crypto disk recovery
+                self._init_v1_encryption()
+                self._init_v2_encryption()
+                self._init_signing_key()
+                self._finish_rotation_recovery()  # Stage 2: post-crypto re-sign
+                self._init_security_state()       # Stage 3: integrity marker
+                self._migrate_v1_to_v2()
+                self._verify_and_update_checkpoint()  # Stage 4: checkpoint
+        except BaseException:
+            self._release_lock()
+            raise
         return self.root
 
     def _init_v1_encryption(self):
@@ -318,6 +365,136 @@ class Vault:
             mac = compute_hmac(content.encode(), self._signing_key)
             _secure_write_text(state_path.with_suffix(".hmac"), mac + "\n")
 
+    # ── Checkpoint ────────────────────────────────────────────────────────
+
+    def _compute_checkpoint(self) -> dict:
+        """Compute current vault checkpoint payload. No raw PII."""
+        # Receipt hashes root
+        receipt_hashes = []
+        for path in self.list_receipts():
+            receipt_hashes.append(hashlib.sha256(path.read_bytes()).hexdigest())
+        receipt_hashes.sort()
+        receipt_root = hashlib.sha256(
+            "\n".join(receipt_hashes).encode()
+        ).hexdigest()
+
+        # Evidence manifest hash (filename:ciphertext_hash pairs)
+        evidence_entries = []
+        evidence_dir = self.root / "evidence"
+        if evidence_dir.exists():
+            for v2_path in sorted(evidence_dir.glob("*.v2.json")):
+                try:
+                    stored = json.loads(v2_path.read_text())
+                    ct_hash = stored.get("ciphertext_hash", "")
+                except (json.JSONDecodeError, OSError):
+                    ct_hash = "unreadable"
+                evidence_entries.append(f"{v2_path.name}:{ct_hash}")
+        evidence_manifest = hashlib.sha256(
+            "\n".join(evidence_entries).encode()
+        ).hexdigest()
+
+        # Signed index hash
+        index_path = self.root / SIGNED_RECEIPTS_INDEX
+        index_hash = hashlib.sha256(
+            index_path.read_bytes() if index_path.exists() else b""
+        ).hexdigest()
+
+        # Security state hash
+        state_path = self.root / SECURITY_STATE_FILE
+        state_hash = hashlib.sha256(
+            state_path.read_bytes() if state_path.exists() else b""
+        ).hexdigest()
+
+        epoch = 0
+        if self._security_state:
+            epoch = self._security_state.get("security_epoch", 0)
+
+        return {
+            "schema": "almanac.checkpoint.v1",
+            "vault_id": self._vault_id,
+            "security_epoch": epoch,
+            "receipt_count": len(receipt_hashes),
+            "receipt_hashes_root": receipt_root,
+            "signed_index_hash": index_hash,
+            "security_state_hash": state_hash,
+            "evidence_manifest_hash": evidence_manifest,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @staticmethod
+    def _compute_checkpoint_root(payload: dict) -> str:
+        """SHA-256 of canonical payload (excludes updated_at — informational only)."""
+        hashable = {k: v for k, v in payload.items() if k != "updated_at"}
+        canonical = json.dumps(hashable, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    def _save_checkpoint(self) -> None:
+        """Compute and save checkpoint + HMAC + root hash file."""
+        payload = self._compute_checkpoint()
+        root = self._compute_checkpoint_root(payload)
+
+        ckpt_path = self.root / CHECKPOINT_FILE
+        content = json.dumps(payload, indent=2) + "\n"
+        _secure_write_text(ckpt_path, content)
+
+        if self._signing_key:
+            mac = compute_hmac(content.encode(), self._signing_key)
+            _secure_write_text(ckpt_path.with_suffix(".hmac"), mac + "\n")
+
+        _secure_write_text(self.root / CHECKPOINT_ROOT_FILE, root + "\n")
+
+    def _verify_checkpoint(self) -> None:
+        """Verify existing checkpoint HMAC. Detects checkpoint tampering."""
+        ckpt_path = self.root / CHECKPOINT_FILE
+        if not ckpt_path.exists():
+            return
+        hmac_path = ckpt_path.with_suffix(".hmac")
+        if self._signing_key and hmac_path.exists():
+            data = ckpt_path.read_bytes()
+            expected = hmac_path.read_text().strip()
+            if not verify_hmac(data, self._signing_key, expected):
+                raise ValueError(
+                    "CHECKPOINT.json HMAC verification failed — "
+                    "checkpoint may have been tampered with"
+                )
+
+    def _update_checkpoint(self) -> None:
+        """Save updated checkpoint. Only for encrypted vaults."""
+        if not self._signing_key:
+            return
+        self._save_checkpoint()
+
+    def _verify_and_update_checkpoint(self) -> None:
+        """Verify checkpoint HMAC, then update to current state."""
+        if not self._signing_key:
+            return
+        self._verify_checkpoint()
+        self._save_checkpoint()
+
+    def export_checkpoint(self) -> dict:
+        """Export checkpoint root + payload for external anchoring.
+
+        Store checkpoint_root outside the vault to detect rollback.
+        Returns no secrets — only hashes and metadata.
+        """
+        payload = self._compute_checkpoint()
+        root = self._compute_checkpoint_root(payload)
+        return {
+            "checkpoint_root": root,
+            "checkpoint_payload": payload,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def verify_checkpoint_bundle(self, bundle: dict) -> bool:
+        """Verify an exported checkpoint against current vault state.
+
+        Recomputes current checkpoint and compares roots. Returns False
+        if the vault state has changed since the bundle was exported.
+        """
+        current = self._compute_checkpoint()
+        current_root = self._compute_checkpoint_root(current)
+        return current_root == bundle.get("checkpoint_root", "")
+
     def _recover_rotation(self):
         """Stage 1 rotation recovery: fix disk state before crypto init.
 
@@ -406,6 +583,13 @@ class Vault:
                 state_data = state_path.read_bytes()
                 mac = compute_hmac(state_data, self._signing_key)
                 _secure_write_text(state_path.with_suffix(".hmac"), mac + "\n")
+
+            # Re-sign checkpoint (its HMAC is from the pre-rotation key)
+            ckpt_path = self.root / CHECKPOINT_FILE
+            if ckpt_path.exists() and self._signing_key:
+                ckpt_data = ckpt_path.read_bytes()
+                mac = compute_hmac(ckpt_data, self._signing_key)
+                _secure_write_text(ckpt_path.with_suffix(".hmac"), mac + "\n")
 
             journal_path.unlink()
 
@@ -617,6 +801,7 @@ class Vault:
 
         _secure_write_text(path, json.dumps(receipt, indent=2) + "\n")
         self._sign_receipt(path)
+        self._update_checkpoint()
         return path
 
     def store_chain(self, chain: dict) -> Path:
@@ -663,6 +848,7 @@ class Vault:
             # No encryption — plaintext fallback
             path = evidence_dir / f"{evidence_hash[:16]}.bin"
             _secure_write_bytes(path, data)
+        self._update_checkpoint()
         return path
 
     def load_evidence(
@@ -896,11 +1082,97 @@ class Vault:
         # Phase 9: Clean up journal
         journal_path.unlink()
 
+        # Phase 10: Update checkpoint
+        self._update_checkpoint()
+
         return {
             "evidence_rotated": len(evidence_items),
             "receipts_re_signed": receipts_signed,
             "new_scrypt_salt": new_scrypt_salt.hex()[:16] + "...",
         }
+
+    # ── Legacy archive cleanup ─────────────────────────────────────────
+
+    def list_legacy_archives(self) -> list[Path]:
+        """List all .enc.migrated files in the evidence directory."""
+        evidence_dir = self.root / "evidence"
+        if not evidence_dir.exists():
+            return []
+        return sorted(evidence_dir.glob("*.enc.migrated"))
+
+    def reencrypt_legacy_archives_under_v2(self) -> dict:
+        """Re-encrypt .enc.migrated files under v2, then remove originals.
+
+        For each .enc.migrated:
+          - If .v2.json exists and decrypts: safe to delete .enc.migrated
+          - Otherwise: decrypt with v1 key, encrypt under v2, verify, delete
+        """
+        if not self.encrypted or not self._vault_key:
+            raise ValueError(
+                "Both v1 and v2 encryption required for legacy re-encryption"
+            )
+        archives = self.list_legacy_archives()
+        if not archives:
+            return {"archives_processed": 0}
+
+        processed = 0
+        for migrated_path in archives:
+            evidence_hash = migrated_path.name.replace(".enc.migrated", "")
+            v2_path = self.root / "evidence" / f"{evidence_hash}.v2.json"
+
+            if v2_path.exists():
+                # Verify v2 copy decrypts — if good, just remove legacy
+                try:
+                    self.load_evidence(evidence_hash)
+                    migrated_path.unlink()
+                    processed += 1
+                    continue
+                except Exception:
+                    pass  # v2 corrupt — fall through to re-encrypt
+
+            # Decrypt with v1 Fernet and re-encrypt under v2
+            plaintext = _fernet_decrypt(
+                migrated_path.read_bytes(), self._vault_key
+            )
+            ctx = self._default_structure_context(evidence_hash)
+            envelope = _v2_encrypt(
+                plaintext, self._vault_secret, self._user_commitment,
+                self._v2_vault_salt, self._v2_scrypt_salt, ctx,
+            )
+            stored = envelope.to_dict()
+            stored["ciphertext_hex"] = envelope.ciphertext.hex()
+            _secure_write_text(
+                v2_path, json.dumps(stored, indent=2) + "\n"
+            )
+
+            # Verify the new v2 file decrypts to same plaintext
+            recovered = self.load_evidence(evidence_hash)
+            if recovered != plaintext:
+                raise RuntimeError(
+                    f"Legacy re-encryption verification failed: {evidence_hash}"
+                )
+
+            migrated_path.unlink()
+            processed += 1
+
+        self._update_checkpoint()
+        return {"archives_processed": processed}
+
+    def purge_legacy_archives(self, confirm: bool = False) -> dict:
+        """Delete all .enc.migrated files. Requires explicit confirm=True.
+
+        WARNING: This permanently removes legacy Fernet ciphertext.
+        Only use after verifying .v2.json copies are intact.
+        """
+        if not confirm:
+            raise ValueError(
+                "purge_legacy_archives requires confirm=True to proceed"
+            )
+        archives = self.list_legacy_archives()
+        for path in archives:
+            path.unlink()
+        self._update_checkpoint()
+        return {"archives_purged": len(archives)}
 
     def broker_report(self) -> dict[str, dict]:
         """Per-broker summary across all receipt types."""

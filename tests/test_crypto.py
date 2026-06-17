@@ -164,6 +164,7 @@ def test_encrypted_vault_wrong_secret_fails():
         v1 = Vault(td, user_commitment=commit, vault_secret="correct-secret")
         v1.init()
         v1.store_evidence("abc123def456", "secret stuff")
+        v1.close()
         # Same commitment, wrong secret — vault refuses to open (HMAC check)
         v2 = Vault(td, user_commitment=commit, vault_secret="wrong-secret")
         try:
@@ -185,6 +186,7 @@ def test_encrypted_vault_salt_persists():
         salt_path = Path(td) / VAULT_SALT_FILE
         assert salt_path.exists()
         salt1 = salt_path.read_text().strip()
+        v1.close()
         # Re-open vault with same secret, same commitment
         v2 = Vault(td, user_commitment=commit, vault_secret="my-secret-2026")
         v2.init()

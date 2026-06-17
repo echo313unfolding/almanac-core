@@ -5,11 +5,12 @@ Open receipt protocol for personal data-rights infrastructure.
 ## Audit Gate
 
 ```text
-Almanac Core receipt protocol: 160/160 PASS
+Almanac Core receipt protocol: 190/190 PASS
   test_receipts:   27 (schemas, chain, vault, demo)
   test_crypto:     14 (v1 key derivation, Fernet encrypt/decrypt, vault encryption)
   test_crypto_v2:  31 (structure binding, AES-256-GCM, KEK/DEK, AAD, DEK wrap AAD)
   test_vault_v2:   69 (vault integration, signing, migration, rotation, HMAC index, downgrade, security state, atomic writes)
+  test_vault_v37:  30 (vault locking, checkpoint roots, external checkpoint, legacy archive cleanup)
   test_safety:     19 (risk scoring, cohort gates, contextual adjustments)
 ```
 
@@ -101,6 +102,33 @@ Almanac Core receipt protocol: 160/160 PASS
 * Security epoch increments on key rotation.
 * Security state + HMAC written with 0600 permissions.
 * Unencrypted vaults do not create security state.
+* Vault locking: flock-based single-writer protection (LOCK_EX | LOCK_NB).
+* Second Vault on same directory blocked while first holds lock.
+* Lock released on close(), context manager exit, and init() failure.
+* No stale lock after failed init (weak passphrase, wrong secret).
+* Lock file written with 0600 permissions.
+* close() is idempotent (multiple calls safe).
+* CHECKPOINT.json computed on init and updated on store/evidence/rotation.
+* Checkpoint root: SHA-256 of canonical JSON (sorted keys, compact separators).
+* Checkpoint root is deterministic (same state → same hash).
+* Checkpoint root changes on receipt store, evidence store, and key rotation.
+* Checkpoint payload contains no raw PII (only hashes and metadata).
+* Checkpoint HMAC tamper detected on re-open.
+* Checkpoint files written with 0600 permissions.
+* Checkpoint payload includes vault_id, security_epoch, receipt_hashes_root, evidence_manifest_hash.
+* Unencrypted vaults do not create checkpoint files.
+* Rollback detection: export_checkpoint() + verify_checkpoint_bundle() detect vault state changes.
+* Exported checkpoint contains checkpoint_root (64-char SHA-256 hex) + full payload.
+* Stale checkpoint (pre-change) fails verification against post-change state.
+* Exported checkpoint contains no PII or secrets.
+* Checkpoint survives close/reopen cycle (consistent root across sessions).
+* Rotation recovery re-signs checkpoint HMAC with post-rotation key.
+* Legacy archive listing: list_legacy_archives() finds .enc.migrated files.
+* Legacy re-encryption: reencrypt_legacy_archives_under_v2() verifies + removes .enc.migrated.
+* Re-encryption preserves existing .v2.json (does not overwrite valid copies).
+* purge_legacy_archives() requires explicit confirm=True (fail-closed).
+* Purge deletes only .enc.migrated, not .v2.json evidence.
+* Empty legacy archive operations are safe no-ops.
 * PII risk scoring across 15 record categories (6 dimensions).
 * High-risk categories (SSN, health, mugshot) correctly blocked.
 * Cohort safety gate enforces minimums (50 default, 100 sensitive).
@@ -108,6 +136,7 @@ Almanac Core receipt protocol: 160/160 PASS
 
 ## What is not proven yet
 
+* Approved device registry (v0.3.8).
 * Real broker connector integrations.
 * Production DSAR/DROP workflows.
 * Legal compliance certification.
@@ -118,6 +147,14 @@ Almanac Core receipt protocol: 160/160 PASS
 * Post-quantum key encapsulation (ML-KEM / FIPS 203).
 * Post-quantum receipt signatures (ML-DSA / FIPS 204).
 * Hash-based backup signatures (SLH-DSA / FIPS 205).
+
+## Control Doctrine
+
+Three controls protect the vault:
+
+1. **Secret** — who can decrypt (vault_secret).
+2. **Checkpoint** — whether history was rolled back (checkpoint root).
+3. **Device** — where state may advance (approved device registry, v0.3.8).
 
 ## Encryption Doctrine
 
@@ -137,8 +174,9 @@ capsule boundaries, and policy-gated access.
 v0.2: Encrypted local vault with structure-bound keys (Fernet MVP)
 v0.3: AES-256-GCM + AAD + scrypt-n17/HKDF + structure-bound envelope + passphrase gate
 v0.3.5: Verified migration, transactional rotation, HMAC sidecar deletion detection
-v0.3.6: Atomic writes, security state marker, wrong-secret recovery guard, collision detection  ← current
-v0.3.7: External checkpoint / rollback detection
+v0.3.6: Atomic writes, security state marker, wrong-secret recovery guard, collision detection
+v0.3.7: Vault locking, checkpoint roots, external checkpoint, legacy archive hardening  ← current
+v0.3.8: Approved device registry
 v0.4: PQ-ready interfaces (ML-KEM/ML-DSA/SLH-DSA type stubs)
 v1.0: ML-KEM/ML-DSA/SLH-DSA wired and tested
 ```
