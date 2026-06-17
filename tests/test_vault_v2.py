@@ -176,10 +176,21 @@ def test_plaintext_bin_still_loads():
         assert recovered == b"plaintext data"
 
 
-def test_v2_no_secret_falls_back_to_bin():
-    """Without vault_secret, evidence is stored as plaintext .bin."""
+def test_v2_commitment_without_secret_raises():
+    """Commitment without secret must fail-closed — never silently write plaintext."""
     with tempfile.TemporaryDirectory() as td:
         v = Vault(td, user_commitment=COMMIT)
+        try:
+            v.init()
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
+            assert "vault_secret is empty" in str(e)
+
+
+def test_v2_no_credentials_writes_bin():
+    """Without any credentials, evidence is stored as plaintext .bin."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td)
         v.init()
         assert not v.encrypted
         path = v.store_evidence("a1b2c3d4e5f60000", "unencrypted data")
@@ -252,6 +263,39 @@ def test_load_missing_evidence_raises():
         except FileNotFoundError:
             pass
 
+
+# ── Passphrase strength gate ──────────────────────────────────────────────────
+
+def test_weak_passphrase_rejected():
+    """Short passphrases must be rejected at vault init."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret="short")
+        try:
+            v.init()
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
+            assert "at least 12" in str(e)
+
+
+def test_low_entropy_passphrase_rejected():
+    """All-same-character passphrases must be rejected."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret="aaaaaaaaaaaa")
+        try:
+            v.init()
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
+            assert "unique characters" in str(e)
+
+
+def test_strong_passphrase_accepted():
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret="correct-horse-battery")
+        v.init()
+        assert v.encrypted
+
+
+# ── Error cases ──────────────────────────────────────────────────────────────
 
 def test_v2_encrypted_but_no_secret_on_load_raises():
     """Opening a vault with v2-encrypted evidence but no secret must fail."""

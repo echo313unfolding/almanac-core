@@ -49,6 +49,26 @@ except ImportError:
 VAULT_SALT_FILE = "vault_salt_v2.key"
 SCRYPT_SALT_FILE = "scrypt_salt_v2.key"
 HKDF_INFO_PREFIX = b"almanac-core-vault-v2|"
+MIN_SECRET_LENGTH = 12
+SCRYPT_N = 2**17  # OWASP recommended for file encryption
+
+
+# ── Passphrase validation ─────────────────────────────────────────────────────
+
+def validate_secret(vault_secret: str) -> list[str]:
+    """Check passphrase strength. Returns list of failure reasons (empty = OK)."""
+    errors = []
+    if len(vault_secret) < MIN_SECRET_LENGTH:
+        errors.append(
+            f"vault_secret must be at least {MIN_SECRET_LENGTH} characters "
+            f"(got {len(vault_secret)})"
+        )
+    # Reject all-same-character secrets
+    if len(set(vault_secret)) < 4:
+        errors.append(
+            "vault_secret has too few unique characters (need at least 4)"
+        )
+    return errors
 
 
 # ── Salt generation ──────────────────────────────────────────────────────────
@@ -76,7 +96,7 @@ def derive_kek(
     different receipt context produces a different KEK.
     """
     # Step 1: Harden the passphrase with scrypt
-    kdf = Scrypt(salt=scrypt_salt, length=32, n=2**14, r=8, p=1)
+    kdf = Scrypt(salt=scrypt_salt, length=32, n=SCRYPT_N, r=8, p=1)
     passphrase_key = kdf.derive(
         f"{vault_secret}|{user_commitment}".encode()
     )
@@ -217,7 +237,7 @@ def encrypt_evidence(
     return EncryptedEnvelope(
         schema="almanac.encrypted_envelope.v2",
         algorithm="AES-256-GCM",
-        kdf="scrypt-n14-r8-p1+HKDF-SHA256",
+        kdf="scrypt-n17-r8-p1+HKDF-SHA256",
         vault_salt_hash=sha256_hex(vault_salt),
         structure_context_hash=structure_context_hash(structure_ctx),
         aad_hash=sha256_hex(aad),

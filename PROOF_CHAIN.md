@@ -5,11 +5,11 @@ Open receipt protocol for personal data-rights infrastructure.
 ## Audit Gate
 
 ```text
-Almanac Core receipt protocol: 104/104 PASS
+Almanac Core receipt protocol: 108/108 PASS
   test_receipts:   27 (schemas, chain, vault, demo)
   test_crypto:     14 (v1 key derivation, Fernet encrypt/decrypt, vault encryption)
   test_crypto_v2:  28 (structure binding, AES-256-GCM, KEK/DEK, AAD, tamper detection)
-  test_vault_v2:   16 (vault↔crypto_v2 integration, auto-detect, salt persistence)
+  test_vault_v2:   20 (vault↔crypto_v2 integration, passphrase gate, fail-closed)
   test_safety:     19 (risk scoring, cohort gates, contextual adjustments)
 ```
 
@@ -37,6 +37,10 @@ Almanac Core receipt protocol: 104/104 PASS
 * Default structure context binds evidence to user_commitment + evidence_hash + vault_id.
 * Wrong structure context (receipt_id, policy_hash) fails v2 vault decrypt.
 * Encrypted v2 vault without secret on load raises descriptive error.
+* Passphrase strength gate: minimum 12 characters, minimum 4 unique characters.
+* Weak passphrase rejected at vault init (fail-closed).
+* user_commitment without vault_secret raises ValueError (fail-closed, not fail-open).
+* scrypt cost parameter n=2^17 (OWASP recommended for file encryption).
 * v2: scrypt passphrase hardening + HKDF context binding.
 * v2: Per-blob DEK wrapped by KEK (key hierarchy).
 * v2: Structure context (receipt_id, chain_position, policy_hash) binds the key.
@@ -81,7 +85,7 @@ capsule boundaries, and policy-gated access.
 
 ```text
 v0.2: Encrypted local vault with structure-bound keys (Fernet MVP)
-v0.3: AES-256-GCM + AAD + scrypt/HKDF + structure-bound envelope  ← current
+v0.3: AES-256-GCM + AAD + scrypt-n17/HKDF + structure-bound envelope + passphrase gate  ← current
 v0.4: PQ-ready interfaces (ML-KEM/ML-DSA/SLH-DSA type stubs)
 v1.0: ML-KEM/ML-DSA/SLH-DSA wired and tested
 ```

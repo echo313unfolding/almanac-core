@@ -145,16 +145,17 @@ def test_unencrypted_vault_evidence():
         assert path.suffix == ".bin"
         assert path.read_bytes() == b"raw html content"
 
-def test_vault_commitment_without_secret_not_encrypted():
-    """Providing user_commitment alone (no secret) must NOT enable encryption."""
+def test_vault_commitment_without_secret_raises():
+    """Providing user_commitment alone (no secret) must FAIL — fail-closed."""
     from vault import Vault
     commit = user_commitment("Jane Doe", "jane@example.com", "test")
     with tempfile.TemporaryDirectory() as td:
         v = Vault(td, user_commitment=commit)  # no vault_secret
-        v.init()
-        assert not v.encrypted
-        path = v.store_evidence("abc123def456", "plaintext data")
-        assert path.suffix == ".bin"
+        try:
+            v.init()
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
+            assert "vault_secret is empty" in str(e)
 
 def test_encrypted_vault_wrong_secret_fails():
     from vault import Vault
@@ -177,14 +178,14 @@ def test_encrypted_vault_salt_persists():
     from crypto import VAULT_SALT_FILE
     commit = user_commitment("Jane Doe", "jane@example.com", "persist-test")
     with tempfile.TemporaryDirectory() as td:
-        v1 = Vault(td, user_commitment=commit, vault_secret="my-secret")
+        v1 = Vault(td, user_commitment=commit, vault_secret="my-secret-2026")
         v1.init()
         v1.store_evidence("abc123def456", "data1")
         salt_path = Path(td) / VAULT_SALT_FILE
         assert salt_path.exists()
         salt1 = salt_path.read_text().strip()
         # Re-open vault with same secret, same commitment
-        v2 = Vault(td, user_commitment=commit, vault_secret="my-secret")
+        v2 = Vault(td, user_commitment=commit, vault_secret="my-secret-2026")
         v2.init()
         recovered = v2.load_evidence("abc123def456")
         assert recovered == b"data1"

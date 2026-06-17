@@ -328,7 +328,7 @@ def test_envelope_to_dict_roundtrip():
     # Verify expected fields
     assert d["schema"] == "almanac.encrypted_envelope.v2"
     assert d["algorithm"] == "AES-256-GCM"
-    assert d["kdf"] == "scrypt-n14-r8-p1+HKDF-SHA256"
+    assert d["kdf"] == "scrypt-n17-r8-p1+HKDF-SHA256"
     assert len(d["nonce_hex"]) == 24  # 12 bytes = 24 hex chars
     assert d["ciphertext_bytes"] > 0
     # Reconstruct and decrypt

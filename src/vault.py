@@ -31,6 +31,7 @@ try:
         encrypt_evidence as _v2_encrypt,
         decrypt_evidence as _v2_decrypt,
         EncryptedEnvelope,
+        validate_secret,
         VAULT_SALT_FILE as V2_SALT_FILE,
         SCRYPT_SALT_FILE,
     )
@@ -48,6 +49,7 @@ except ImportError:
         encrypt_evidence as _v2_encrypt,
         decrypt_evidence as _v2_decrypt,
         EncryptedEnvelope,
+        validate_secret,
         VAULT_SALT_FILE as V2_SALT_FILE,
         SCRYPT_SALT_FILE,
     )
@@ -101,7 +103,27 @@ class Vault:
         self._vault_id: str = ""
 
     def init(self) -> Path:
-        """Create vault directory structure. Idempotent."""
+        """Create vault directory structure. Idempotent.
+
+        Raises ValueError if user_commitment is set but vault_secret is
+        missing or too weak (fail-closed — never silently store plaintext
+        when the caller intended encryption).
+        """
+        # Fail-closed: commitment without secret is a configuration error
+        if self._user_commitment and not self._vault_secret:
+            raise ValueError(
+                "user_commitment is set but vault_secret is empty. "
+                "Evidence would be stored as plaintext. Either provide a "
+                "vault_secret or omit user_commitment for an unencrypted vault."
+            )
+        # Passphrase strength gate
+        if self._vault_secret:
+            errors = validate_secret(self._vault_secret)
+            if errors:
+                raise ValueError(
+                    f"Weak vault_secret: {'; '.join(errors)}"
+                )
+
         for sub in SUBDIRS:
             (self.root / sub).mkdir(parents=True, exist_ok=True)
         manifest = self.root / "MANIFEST.md"
