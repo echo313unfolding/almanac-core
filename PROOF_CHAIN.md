@@ -5,11 +5,11 @@ Open receipt protocol for personal data-rights infrastructure.
 ## Audit Gate
 
 ```text
-Almanac Core receipt protocol: 114/114 PASS
+Almanac Core receipt protocol: 128/128 PASS
   test_receipts:   27 (schemas, chain, vault, demo)
   test_crypto:     14 (v1 key derivation, Fernet encrypt/decrypt, vault encryption)
   test_crypto_v2:  31 (structure binding, AES-256-GCM, KEK/DEK, AAD, DEK wrap AAD)
-  test_vault_v2:   23 (vault↔crypto_v2 integration, permissions, passphrase gate)
+  test_vault_v2:   37 (vault integration, signing, migration, rotation, downgrade)
   test_safety:     19 (risk scoring, cohort gates, contextual adjustments)
 ```
 
@@ -45,6 +45,16 @@ Almanac Core receipt protocol: 114/114 PASS
 * Wrong wrap AAD fails GCM authentication.
 * Salt files written with 0600 permissions (owner-only read/write).
 * Evidence files (encrypted and plaintext) written with 0600 permissions.
+* Receipt HMAC-SHA256 signing: sidecar .hmac file created on store, verified on load.
+* Signing key derived independently from KEK (different HKDF info field).
+* Tampered receipt detected by HMAC verification on load.
+* HMAC sidecars written with 0600 permissions.
+* v1→v2 auto-migration: legacy .enc files re-encrypted to .v2.json on vault open.
+* Migration skips already-migrated files (idempotent).
+* Key rotation: rotate_secret() re-encrypts all evidence with new scrypt salt.
+* Rotation re-signs all receipts with new signing key.
+* Rotation rejects weak secrets, same secret, and unencrypted vaults.
+* Downgrade protection: encrypted vault refuses to load .bin evidence.
 * v2: scrypt passphrase hardening + HKDF context binding.
 * v2: Per-blob DEK wrapped by KEK (key hierarchy).
 * v2: Structure context (receipt_id, chain_position, policy_hash) binds the key.

@@ -29,6 +29,7 @@ Doctrine:
 """
 
 import hashlib
+import hmac
 import json
 import os
 import time
@@ -49,6 +50,7 @@ except ImportError:
 VAULT_SALT_FILE = "vault_salt_v2.key"
 SCRYPT_SALT_FILE = "scrypt_salt_v2.key"
 HKDF_INFO_PREFIX = b"almanac-core-vault-v2|"
+HKDF_HMAC_INFO = b"almanac-core-vault-hmac-v1"
 MIN_SECRET_LENGTH = 12
 SCRYPT_N = 2**17  # OWASP recommended for file encryption
 
@@ -76,6 +78,43 @@ def validate_secret(vault_secret: str) -> list[str]:
 def generate_salt() -> bytes:
     """Generate a 32-byte random salt."""
     return os.urandom(32)
+
+
+# ── Signing key derivation ────────────────────────────────────────────────
+
+def derive_signing_key(
+    vault_secret: str,
+    user_commitment: str,
+    vault_salt: bytes,
+    scrypt_salt: bytes,
+) -> bytes:
+    """Derive a 32-byte HMAC signing key, independent of any KEK.
+
+    Uses the same scrypt hardening but a different HKDF info field,
+    so compromise of a KEK does not compromise receipt signing.
+    """
+    kdf = Scrypt(salt=scrypt_salt, length=32, n=SCRYPT_N, r=8, p=1)
+    passphrase_key = kdf.derive(
+        f"{vault_secret}|{user_commitment}".encode()
+    )
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=vault_salt,
+        info=HKDF_HMAC_INFO,
+    )
+    return hkdf.derive(passphrase_key)
+
+
+def compute_hmac(data: bytes, signing_key: bytes) -> str:
+    """HMAC-SHA256 of data. Returns hex digest."""
+    return hmac.new(signing_key, data, hashlib.sha256).hexdigest()
+
+
+def verify_hmac(data: bytes, signing_key: bytes, expected_hex: str) -> bool:
+    """Constant-time HMAC verification."""
+    actual = hmac.new(signing_key, data, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(actual, expected_hex)
 
 
 # ── Key derivation ───────────────────────────────────────────────────────────

@@ -48,6 +48,9 @@ try:
         decrypt_evidence as _v2_decrypt,
         EncryptedEnvelope,
         validate_secret,
+        derive_signing_key,
+        compute_hmac,
+        verify_hmac,
         VAULT_SALT_FILE as V2_SALT_FILE,
         SCRYPT_SALT_FILE,
     )
@@ -66,6 +69,9 @@ except ImportError:
         decrypt_evidence as _v2_decrypt,
         EncryptedEnvelope,
         validate_secret,
+        derive_signing_key,
+        compute_hmac,
+        verify_hmac,
         VAULT_SALT_FILE as V2_SALT_FILE,
         SCRYPT_SALT_FILE,
     )
@@ -117,6 +123,8 @@ class Vault:
         self._v2_vault_salt: bytes | None = None
         self._v2_scrypt_salt: bytes | None = None
         self._vault_id: str = ""
+        # HMAC signing key (derived independently from KEK)
+        self._signing_key: bytes | None = None
 
     def init(self) -> Path:
         """Create vault directory structure. Idempotent.
@@ -153,6 +161,8 @@ class Vault:
         if self._vault_secret and self._user_commitment:
             self._init_v1_encryption()
             self._init_v2_encryption()
+            self._init_signing_key()
+            self._migrate_v1_to_v2()
         return self.root
 
     def _init_v1_encryption(self):
@@ -184,6 +194,72 @@ class Vault:
             _secure_write_text(ss_path, self._v2_scrypt_salt.hex() + "\n")
 
         self._vault_id = hashlib.sha256(self._v2_vault_salt).hexdigest()[:16]
+
+    def _init_signing_key(self):
+        """Derive HMAC signing key (independent of KEK)."""
+        self._signing_key = derive_signing_key(
+            self._vault_secret,
+            self._user_commitment,
+            self._v2_vault_salt,
+            self._v2_scrypt_salt,
+        )
+
+    def _migrate_v1_to_v2(self):
+        """Auto-migrate legacy .enc evidence files to v2 .v2.json.
+
+        Runs on every init when both v1 key and v2 salts are available.
+        Decrypts with v1 Fernet, re-encrypts with v2 AES-256-GCM,
+        then removes the old .enc file.
+        """
+        if not self._vault_key or not self._v2_vault_salt:
+            return
+        evidence_dir = self.root / "evidence"
+        if not evidence_dir.exists():
+            return
+        for enc_path in sorted(evidence_dir.glob("*.enc")):
+            evidence_hash = enc_path.stem  # e.g. "abc123def456" from "abc123def456.enc"
+            v2_path = evidence_dir / f"{evidence_hash}.v2.json"
+            if v2_path.exists():
+                continue  # already migrated
+            plaintext = _fernet_decrypt(enc_path.read_bytes(), self._vault_key)
+            ctx = self._default_structure_context(evidence_hash)
+            envelope = _v2_encrypt(
+                plaintext,
+                self._vault_secret,
+                self._user_commitment,
+                self._v2_vault_salt,
+                self._v2_scrypt_salt,
+                ctx,
+            )
+            stored = envelope.to_dict()
+            stored["ciphertext_hex"] = envelope.ciphertext.hex()
+            _secure_write_text(v2_path, json.dumps(stored, indent=2) + "\n")
+            enc_path.unlink()
+
+    def _sign_receipt(self, path: Path) -> None:
+        """Write HMAC-SHA256 sidecar for a receipt file."""
+        if not self._signing_key:
+            return
+        data = path.read_bytes()
+        mac = compute_hmac(data, self._signing_key)
+        _secure_write_text(path.with_suffix(".hmac"), mac + "\n")
+
+    def _verify_receipt_hmac(self, path: Path) -> None:
+        """Verify HMAC sidecar if it exists and vault has signing key.
+
+        Raises ValueError on mismatch. Silent if no sidecar or no key.
+        """
+        hmac_path = path.with_suffix(".hmac")
+        if not hmac_path.exists():
+            return
+        if not self._signing_key:
+            return  # can't verify without key
+        expected = hmac_path.read_text().strip()
+        data = path.read_bytes()
+        if not verify_hmac(data, self._signing_key, expected):
+            raise ValueError(
+                f"Receipt HMAC verification failed: {path.name} has been tampered with"
+            )
 
     @property
     def encrypted(self) -> bool:
@@ -227,6 +303,7 @@ class Vault:
         path = target_dir / fname
 
         path.write_text(json.dumps(receipt, indent=2) + "\n")
+        self._sign_receipt(path)
         return path
 
     def store_chain(self, chain: dict) -> Path:
@@ -317,6 +394,14 @@ class Vault:
                 )
             return _fernet_decrypt(enc_path.read_bytes(), self._vault_key)
         elif bin_path.exists():
+            # Downgrade protection: if vault is encrypted, refuse plaintext
+            # evidence — attacker may have deleted .v2.json and planted .bin
+            if self.encrypted:
+                raise ValueError(
+                    f"Evidence {evidence_hash[:16]} is plaintext (.bin) but vault "
+                    "is encrypted. Possible downgrade attack. Re-store the evidence "
+                    "or verify the file manually."
+                )
             return bin_path.read_bytes()
         else:
             raise FileNotFoundError(f"No evidence for hash {evidence_hash[:16]}")
@@ -336,7 +421,12 @@ class Vault:
         return results
 
     def load_receipt(self, path: Path) -> dict:
-        """Load and validate a receipt from file."""
+        """Load and validate a receipt from file.
+
+        If an HMAC sidecar exists and vault has a signing key,
+        verifies integrity before returning. Raises ValueError on tamper.
+        """
+        self._verify_receipt_hmac(path)
         receipt = json.loads(path.read_text())
         errors = validate_receipt(receipt)
         if errors:
@@ -360,6 +450,86 @@ class Vault:
         counts["evidence_files"] = len(list((self.root / "evidence").glob("*"))) if (self.root / "evidence").exists() else 0
         counts["total_receipts"] = sum(v for k, v in counts.items() if k not in ("chains", "evidence_files"))
         return counts
+
+    def rotate_secret(self, new_secret: str) -> dict:
+        """Rotate vault_secret: re-encrypt all evidence with new key material.
+
+        Steps:
+          1. Validate new secret strength
+          2. Decrypt all evidence with current secret
+          3. Generate new scrypt salt (vault_salt stays — identifies the vault)
+          4. Re-encrypt all evidence with new secret + new scrypt salt
+          5. Re-sign all receipts with new signing key
+          6. Return summary of what was rotated
+
+        Raises ValueError if vault is not encrypted or new secret is weak.
+        """
+        if not self.encrypted:
+            raise ValueError("Cannot rotate: vault is not encrypted")
+        errors = validate_secret(new_secret)
+        if errors:
+            raise ValueError(f"Weak new secret: {'; '.join(errors)}")
+        if new_secret == self._vault_secret:
+            raise ValueError("New secret must differ from current secret")
+
+        evidence_dir = self.root / "evidence"
+        # Phase 1: Decrypt all evidence with current secret
+        evidence_items: list[tuple[str, bytes, Path]] = []
+        if evidence_dir.exists():
+            for v2_path in sorted(evidence_dir.glob("*.v2.json")):
+                evidence_hash = v2_path.name.replace(".v2.json", "")
+                plaintext = self.load_evidence(evidence_hash)
+                evidence_items.append((evidence_hash, plaintext, v2_path))
+
+        # Phase 2: Generate new scrypt salt, re-derive keys
+        new_scrypt_salt = generate_salt()
+        old_scrypt_path = self.root / SCRYPT_SALT_FILE
+
+        # Phase 3: Re-encrypt all evidence
+        new_paths: list[tuple[Path, Path]] = []  # (new_path, old_path)
+        for evidence_hash, plaintext, old_path in evidence_items:
+            ctx = self._default_structure_context(evidence_hash)
+            envelope = _v2_encrypt(
+                plaintext,
+                new_secret,
+                self._user_commitment,
+                self._v2_vault_salt,
+                new_scrypt_salt,
+                ctx,
+            )
+            stored = envelope.to_dict()
+            stored["ciphertext_hex"] = envelope.ciphertext.hex()
+            # Write to .tmp first, rename after all succeed
+            tmp_path = old_path.with_suffix(".v2.json.tmp")
+            _secure_write_text(tmp_path, json.dumps(stored, indent=2) + "\n")
+            new_paths.append((tmp_path, old_path))
+
+        # Phase 4: Atomic-ish commit — rename all .tmp to .v2.json
+        for tmp_path, old_path in new_paths:
+            tmp_path.rename(old_path)
+
+        # Phase 5: Update scrypt salt on disk
+        _secure_write_text(old_scrypt_path, new_scrypt_salt.hex() + "\n")
+
+        # Phase 6: Update internal state
+        self._vault_secret = new_secret
+        self._v2_scrypt_salt = new_scrypt_salt
+        self._signing_key = derive_signing_key(
+            new_secret, self._user_commitment,
+            self._v2_vault_salt, new_scrypt_salt,
+        )
+
+        # Phase 7: Re-sign all receipts
+        receipts_signed = 0
+        for receipt_path in self.list_receipts():
+            self._sign_receipt(receipt_path)
+            receipts_signed += 1
+
+        return {
+            "evidence_rotated": len(evidence_items),
+            "receipts_re_signed": receipts_signed,
+            "new_scrypt_salt": new_scrypt_salt.hex()[:16] + "...",
+        }
 
     def broker_report(self) -> dict[str, dict]:
         """Per-broker summary across all receipt types."""

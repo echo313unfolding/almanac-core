@@ -347,3 +347,238 @@ def test_plaintext_evidence_files_are_0600():
         v.init()
         path = v.store_evidence("a1b2c3d4e5f60000", "plaintext data")
         assert _file_mode(path) == 0o600
+
+
+# ── Receipt HMAC signing (P2) ────────────────────────────────────────────────
+
+def test_receipt_hmac_created_on_store():
+    """Storing a receipt in an encrypted vault creates an .hmac sidecar."""
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        path = v.store(r)
+        hmac_path = path.with_suffix(".hmac")
+        assert hmac_path.exists()
+        assert len(hmac_path.read_text().strip()) == 64  # SHA-256 hex
+
+
+def test_receipt_hmac_not_created_without_secret():
+    """Unencrypted vault does not create HMAC sidecars."""
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td)
+        v.init()
+        r = discovery_receipt("c", "spokeo", "phone_email", 0.9, "evidence")
+        path = v.store(r)
+        assert not path.with_suffix(".hmac").exists()
+
+
+def test_receipt_hmac_valid_on_load():
+    """Receipt with valid HMAC loads without error."""
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        path = v.store(r)
+        loaded = v.load_receipt(path)
+        assert loaded["receipt_id"] == r["receipt_id"]
+
+
+def test_receipt_hmac_tampered_fails():
+    """Tampered receipt must fail HMAC verification."""
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        path = v.store(r)
+        # Tamper with the receipt file
+        tampered = json.loads(path.read_text())
+        tampered["confidence"] = 0.1
+        path.write_text(json.dumps(tampered, indent=2) + "\n")
+        try:
+            v.load_receipt(path)
+            assert False, "Tampered receipt must fail HMAC"
+        except ValueError as e:
+            assert "tampered" in str(e).lower()
+
+
+def test_receipt_hmac_sidecar_is_0600():
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        path = v.store(r)
+        assert _file_mode(path.with_suffix(".hmac")) == 0o600
+
+
+# ── v1→v2 migration (P2) ────────────────────────────────────────────────────
+
+def test_v1_enc_migrated_to_v2_on_init():
+    """Legacy .enc files are auto-migrated to .v2.json on vault open."""
+    from crypto import encrypt_evidence as fernet_encrypt, derive_vault_key, generate_vault_salt
+    with tempfile.TemporaryDirectory() as td:
+        # Manually create a v1-style .enc file
+        evidence_dir = Path(td) / "evidence"
+        evidence_dir.mkdir(parents=True)
+        # Set up v1 salt
+        v1_salt = generate_vault_salt()
+        (Path(td) / "vault_salt.key").write_text(v1_salt + "\n")
+        v1_key = derive_vault_key(SECRET, COMMIT, v1_salt)
+        ciphertext = fernet_encrypt(b"legacy v1 data", v1_key)
+        enc_path = evidence_dir / "a1b2c3d4e5f60000.enc"
+        enc_path.write_bytes(ciphertext)
+
+        # Open vault — migration should run
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+
+        # .enc should be gone, .v2.json should exist
+        assert not enc_path.exists(), ".enc should be deleted after migration"
+        v2_path = evidence_dir / "a1b2c3d4e5f60000.v2.json"
+        assert v2_path.exists(), ".v2.json should exist after migration"
+
+        # Data must be recoverable
+        recovered = v.load_evidence("a1b2c3d4e5f60000")
+        assert recovered == b"legacy v1 data"
+
+
+def test_v1_migration_skips_already_migrated():
+    """If .v2.json already exists for a hash, migration skips that file."""
+    from crypto import encrypt_evidence as fernet_encrypt, derive_vault_key, generate_vault_salt
+    with tempfile.TemporaryDirectory() as td:
+        evidence_dir = Path(td) / "evidence"
+        evidence_dir.mkdir(parents=True)
+        v1_salt = generate_vault_salt()
+        (Path(td) / "vault_salt.key").write_text(v1_salt + "\n")
+        v1_key = derive_vault_key(SECRET, COMMIT, v1_salt)
+        # Create both .enc and .v2.json for the same hash
+        enc_path = evidence_dir / "a1b2c3d4e5f60000.enc"
+        enc_path.write_bytes(fernet_encrypt(b"old data", v1_key))
+        v2_path = evidence_dir / "a1b2c3d4e5f60000.v2.json"
+        v2_path.write_text('{"already":"migrated"}\n')
+
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+
+        # .enc should still exist (skipped because .v2.json exists)
+        assert enc_path.exists()
+        # .v2.json should be untouched
+        assert "already" in v2_path.read_text()
+
+
+# ── Key rotation (P2) ───────────────────────────────────────────────────────
+
+def test_rotate_secret_re_encrypts_evidence():
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        v.store_evidence("a1b2c3d4e5f60000", "data to rotate")
+        v.store_evidence("b2c3d4e5f6a10000", "more data")
+
+        new_secret = "rotated-passphrase-2026"
+        result = v.rotate_secret(new_secret)
+        assert result["evidence_rotated"] == 2
+
+        # Old secret cannot decrypt
+        v_old = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v_old.init()
+        try:
+            v_old.load_evidence("a1b2c3d4e5f60000")
+            assert False, "Old secret must fail after rotation"
+        except Exception:
+            pass
+
+        # New secret decrypts
+        v_new = Vault(td, user_commitment=COMMIT, vault_secret=new_secret)
+        v_new.init()
+        assert v_new.load_evidence("a1b2c3d4e5f60000") == b"data to rotate"
+        assert v_new.load_evidence("b2c3d4e5f6a10000") == b"more data"
+
+
+def test_rotate_secret_re_signs_receipts():
+    from receipts import discovery_receipt
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        r = discovery_receipt(COMMIT, "spokeo", "phone_email", 0.9, "evidence")
+        path = v.store(r)
+        old_hmac = path.with_suffix(".hmac").read_text().strip()
+
+        new_secret = "rotated-passphrase-2026"
+        result = v.rotate_secret(new_secret)
+        assert result["receipts_re_signed"] >= 1
+
+        new_hmac = path.with_suffix(".hmac").read_text().strip()
+        assert new_hmac != old_hmac  # different signing key = different HMAC
+
+        # New vault verifies the new HMAC
+        v_new = Vault(td, user_commitment=COMMIT, vault_secret=new_secret)
+        v_new.init()
+        loaded = v_new.load_receipt(path)
+        assert loaded["receipt_id"] == r["receipt_id"]
+
+
+def test_rotate_rejects_weak_new_secret():
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        try:
+            v.rotate_secret("short")
+            assert False, "Weak new secret must be rejected"
+        except ValueError as e:
+            assert "Weak" in str(e)
+
+
+def test_rotate_rejects_same_secret():
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        try:
+            v.rotate_secret(SECRET)
+            assert False, "Same secret must be rejected"
+        except ValueError as e:
+            assert "differ" in str(e)
+
+
+def test_rotate_unencrypted_vault_fails():
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td)
+        v.init()
+        try:
+            v.rotate_secret("new-strong-secret-2026")
+            assert False, "Rotate on unencrypted vault must fail"
+        except ValueError as e:
+            assert "not encrypted" in str(e)
+
+
+# ── Downgrade protection (P3) ───────────────────────────────────────────────
+
+def test_downgrade_protection_blocks_bin_in_encrypted_vault():
+    """Encrypted vault refuses to load .bin evidence (possible downgrade attack)."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        # Manually plant a .bin file (simulates attacker)
+        evidence_dir = Path(td) / "evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        (evidence_dir / "deadbeef00000000.bin").write_bytes(b"fake data")
+        try:
+            v.load_evidence("deadbeef00000000")
+            assert False, "Should have raised ValueError for downgrade"
+        except ValueError as e:
+            assert "downgrade" in str(e).lower()
+
+
+def test_downgrade_protection_allows_bin_in_unencrypted_vault():
+    """Unencrypted vault loads .bin normally (no downgrade concern)."""
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td)
+        v.init()
+        v.store_evidence("a1b2c3d4e5f60000", "plaintext data")
+        recovered = v.load_evidence("a1b2c3d4e5f60000")
+        assert recovered == b"plaintext data"
