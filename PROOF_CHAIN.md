@@ -5,11 +5,11 @@ Open receipt protocol for personal data-rights infrastructure.
 ## Audit Gate
 
 ```text
-Almanac Core receipt protocol: 108/108 PASS
+Almanac Core receipt protocol: 114/114 PASS
   test_receipts:   27 (schemas, chain, vault, demo)
   test_crypto:     14 (v1 key derivation, Fernet encrypt/decrypt, vault encryption)
-  test_crypto_v2:  28 (structure binding, AES-256-GCM, KEK/DEK, AAD, tamper detection)
-  test_vault_v2:   20 (vault↔crypto_v2 integration, passphrase gate, fail-closed)
+  test_crypto_v2:  31 (structure binding, AES-256-GCM, KEK/DEK, AAD, DEK wrap AAD)
+  test_vault_v2:   23 (vault↔crypto_v2 integration, permissions, passphrase gate)
   test_safety:     19 (risk scoring, cohort gates, contextual adjustments)
 ```
 
@@ -41,6 +41,10 @@ Almanac Core receipt protocol: 108/108 PASS
 * Weak passphrase rejected at vault init (fail-closed).
 * user_commitment without vault_secret raises ValueError (fail-closed, not fail-open).
 * scrypt cost parameter n=2^17 (OWASP recommended for file encryption).
+* DEK wrapping uses AAD (structure context hash) — prevents cross-envelope DEK swap.
+* Wrong wrap AAD fails GCM authentication.
+* Salt files written with 0600 permissions (owner-only read/write).
+* Evidence files (encrypted and plaintext) written with 0600 permissions.
 * v2: scrypt passphrase hardening + HKDF context binding.
 * v2: Per-blob DEK wrapped by KEK (key hierarchy).
 * v2: Structure context (receipt_id, chain_position, policy_hash) binds the key.

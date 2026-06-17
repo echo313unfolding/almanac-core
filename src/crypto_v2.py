@@ -135,18 +135,22 @@ def decrypt_blob(ciphertext: bytes, dek: bytes, nonce: bytes, aad: bytes) -> byt
     return aesgcm.decrypt(nonce, ciphertext, aad)
 
 
-def wrap_dek(dek: bytes, kek: bytes) -> Tuple[bytes, bytes]:
-    """Wrap DEK with KEK using AES-256-GCM. Returns (wrapped_dek, wrap_nonce)."""
+def wrap_dek(dek: bytes, kek: bytes, aad: bytes | None = None) -> Tuple[bytes, bytes]:
+    """Wrap DEK with KEK using AES-256-GCM. Returns (wrapped_dek, wrap_nonce).
+
+    When aad is provided, the wrapped DEK is bound to that context —
+    unwrapping with different AAD fails GCM authentication.
+    """
     nonce = os.urandom(12)
     aesgcm = AESGCM(kek)
-    wrapped = aesgcm.encrypt(nonce, dek, None)
+    wrapped = aesgcm.encrypt(nonce, dek, aad)
     return wrapped, nonce
 
 
-def unwrap_dek(wrapped_dek: bytes, kek: bytes, wrap_nonce: bytes) -> bytes:
-    """Unwrap DEK. Raises InvalidTag if wrong KEK."""
+def unwrap_dek(wrapped_dek: bytes, kek: bytes, wrap_nonce: bytes, aad: bytes | None = None) -> bytes:
+    """Unwrap DEK. Raises InvalidTag if wrong KEK or wrong AAD."""
     aesgcm = AESGCM(kek)
-    return aesgcm.decrypt(wrap_nonce, wrapped_dek, None)
+    return aesgcm.decrypt(wrap_nonce, wrapped_dek, aad)
 
 
 # ── Encrypted envelope ───────────────────────────────────────────────────────
@@ -232,7 +236,9 @@ def encrypt_evidence(
 
     aad = canonicalize_context(structure_ctx).encode()
     ciphertext, nonce = encrypt_blob(plaintext, dek, aad)
-    wrapped_dek, wrap_nonce = wrap_dek(dek, kek)
+    # Bind wrapped DEK to structure context — prevents cross-envelope DEK swap
+    wrap_aad = b"almanac-dek-wrap|" + structure_context_hash(structure_ctx).encode()
+    wrapped_dek, wrap_nonce = wrap_dek(dek, kek, aad=wrap_aad)
 
     return EncryptedEnvelope(
         schema="almanac.encrypted_envelope.v2",
@@ -264,7 +270,8 @@ def decrypt_evidence(
     Fails if any input is wrong: secret, commitment, salt, or structure.
     """
     kek = derive_kek(vault_secret, user_commitment, vault_salt, scrypt_salt, structure_ctx)
-    dek = unwrap_dek(envelope.wrapped_dek, kek, envelope.wrap_nonce)
+    wrap_aad = b"almanac-dek-wrap|" + structure_context_hash(structure_ctx).encode()
+    dek = unwrap_dek(envelope.wrapped_dek, kek, envelope.wrap_nonce, aad=wrap_aad)
 
     aad = canonicalize_context(structure_ctx).encode()
     return decrypt_blob(envelope.ciphertext, dek, envelope.nonce, aad)

@@ -10,9 +10,12 @@ Tests that vault.py correctly uses crypto_v2 for evidence encryption:
   - commitment without secret stays plaintext
   - no raw PII in envelope JSON
   - v2 salts persist across reopens
+  - file permissions 0600 on sensitive files
 """
 
 import json
+import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -312,3 +315,35 @@ def test_v2_encrypted_but_no_secret_on_load_raises():
             assert False, "Should have raised ValueError"
         except ValueError as e:
             assert "v2-encrypted" in str(e)
+
+
+# ── File permissions ─────────────────────────────────────────────────────────
+
+def _file_mode(path: Path) -> int:
+    """Return the permission bits (last 12 bits) of a file."""
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_salt_files_are_0600():
+    from crypto_v2 import VAULT_SALT_FILE, SCRYPT_SALT_FILE
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        assert _file_mode(Path(td) / VAULT_SALT_FILE) == 0o600
+        assert _file_mode(Path(td) / SCRYPT_SALT_FILE) == 0o600
+
+
+def test_v2_evidence_files_are_0600():
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td, user_commitment=COMMIT, vault_secret=SECRET)
+        v.init()
+        path = v.store_evidence("a1b2c3d4e5f60000", "secret evidence")
+        assert _file_mode(path) == 0o600
+
+
+def test_plaintext_evidence_files_are_0600():
+    with tempfile.TemporaryDirectory() as td:
+        v = Vault(td)
+        v.init()
+        path = v.store_evidence("a1b2c3d4e5f60000", "plaintext data")
+        assert _file_mode(path) == 0o600

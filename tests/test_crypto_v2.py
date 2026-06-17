@@ -175,6 +175,39 @@ def test_dek_wrong_kek_fails():
         pass
 
 
+def test_dek_wrap_with_aad_roundtrip():
+    kek = generate_dek()
+    dek = generate_dek()
+    aad = b"almanac-dek-wrap|abc123"
+    wrapped, nonce = wrap_dek(dek, kek, aad=aad)
+    recovered = unwrap_dek(wrapped, kek, nonce, aad=aad)
+    assert recovered == dek
+
+
+def test_dek_wrap_wrong_aad_fails():
+    """Unwrapping with different AAD must fail GCM authentication."""
+    kek = generate_dek()
+    dek = generate_dek()
+    wrapped, nonce = wrap_dek(dek, kek, aad=b"context-A")
+    try:
+        unwrap_dek(wrapped, kek, nonce, aad=b"context-B")
+        assert False, "Wrong wrap AAD must fail"
+    except Exception:
+        pass
+
+
+def test_dek_wrap_aad_vs_none_fails():
+    """DEK wrapped with AAD cannot be unwrapped without AAD."""
+    kek = generate_dek()
+    dek = generate_dek()
+    wrapped, nonce = wrap_dek(dek, kek, aad=b"bound-context")
+    try:
+        unwrap_dek(wrapped, kek, nonce, aad=None)
+        assert False, "Unwrap without AAD must fail when wrapped with AAD"
+    except Exception:
+        pass
+
+
 # ── Encrypt/decrypt full envelope tests ──────────────────────────────────────
 
 def test_correct_secret_and_structure_decrypts():

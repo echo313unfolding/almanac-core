@@ -15,8 +15,24 @@ The vault_secret must never be committed, exported, or stored in the vault.
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 from datetime import datetime, timezone
+
+# Owner read/write only — no group, no other
+_FILE_MODE = stat.S_IRUSR | stat.S_IWUSR  # 0o600
+
+
+def _secure_write_text(path: Path, content: str) -> None:
+    """Write text and set 0600 permissions."""
+    path.write_text(content)
+    path.chmod(_FILE_MODE)
+
+
+def _secure_write_bytes(path: Path, content: bytes) -> None:
+    """Write bytes and set 0600 permissions."""
+    path.write_bytes(content)
+    path.chmod(_FILE_MODE)
 
 try:
     from .receipts import receipt_hash, validate_receipt
@@ -146,7 +162,7 @@ class Vault:
             vault_salt = salt_path.read_text().strip()
         else:
             vault_salt = generate_vault_salt()
-            salt_path.write_text(vault_salt + "\n")
+            _secure_write_text(salt_path, vault_salt + "\n")
         self._vault_key = derive_vault_key(
             self._vault_secret, self._user_commitment, vault_salt
         )
@@ -158,14 +174,14 @@ class Vault:
             self._v2_vault_salt = bytes.fromhex(vs_path.read_text().strip())
         else:
             self._v2_vault_salt = generate_salt()
-            vs_path.write_text(self._v2_vault_salt.hex() + "\n")
+            _secure_write_text(vs_path, self._v2_vault_salt.hex() + "\n")
 
         ss_path = self.root / SCRYPT_SALT_FILE
         if ss_path.exists():
             self._v2_scrypt_salt = bytes.fromhex(ss_path.read_text().strip())
         else:
             self._v2_scrypt_salt = generate_salt()
-            ss_path.write_text(self._v2_scrypt_salt.hex() + "\n")
+            _secure_write_text(ss_path, self._v2_scrypt_salt.hex() + "\n")
 
         self._vault_id = hashlib.sha256(self._v2_vault_salt).hexdigest()[:16]
 
@@ -252,11 +268,11 @@ class Vault:
             stored = envelope.to_dict()
             stored["ciphertext_hex"] = envelope.ciphertext.hex()
             path = evidence_dir / f"{evidence_hash[:16]}.v2.json"
-            path.write_text(json.dumps(stored, indent=2) + "\n")
+            _secure_write_text(path, json.dumps(stored, indent=2) + "\n")
         else:
             # No encryption — plaintext fallback
             path = evidence_dir / f"{evidence_hash[:16]}.bin"
-            path.write_bytes(data)
+            _secure_write_bytes(path, data)
         return path
 
     def load_evidence(
