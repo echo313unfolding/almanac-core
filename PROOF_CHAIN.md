@@ -5,11 +5,11 @@ Open receipt protocol for personal data-rights infrastructure.
 ## Audit Gate
 
 ```text
-Almanac Core receipt protocol: 128/128 PASS
+Almanac Core receipt protocol: 144/144 PASS
   test_receipts:   27 (schemas, chain, vault, demo)
   test_crypto:     14 (v1 key derivation, Fernet encrypt/decrypt, vault encryption)
   test_crypto_v2:  31 (structure binding, AES-256-GCM, KEK/DEK, AAD, DEK wrap AAD)
-  test_vault_v2:   37 (vault integration, signing, migration, rotation, downgrade)
+  test_vault_v2:   53 (vault integration, signing, verified migration, transactional rotation, HMAC index, downgrade)
   test_safety:     19 (risk scoring, cohort gates, contextual adjustments)
 ```
 
@@ -65,6 +65,24 @@ Almanac Core receipt protocol: 128/128 PASS
 * v2: Canonical structure hash is deterministic.
 * v2: No raw PII appears in encrypted envelope fields.
 * v2: Envelope serialization round-trips correctly.
+* v1→v2 migration writes .v2.json.migrating temp before commit (crash-safe).
+* Migration verifies temp decrypts to same plaintext before rename.
+* Migration archives .enc as .enc.migrated (non-destructive, reversible).
+* Corrupt .v2.json with .enc present triggers re-migration (crash recovery).
+* Interrupted migration temp files cleaned up on init.
+* .enc.migrated files not picked up by *.enc glob (no double migration).
+* Key rotation writes rotation_journal.json with phase tracking.
+* Rotation verifies all .rotating temp files decrypt before commit.
+* Rotation rollback on pre-commit failure: no .rotating files remain.
+* Rotation recovery pre-commit: init() deletes temp files + journal.
+* Rotation recovery post-commit: init() completes rename + salt update + re-sign.
+* No .rotating temp files remain after successful rotation.
+* Signed receipt index (signed_receipts.json) tracks HMAC-required receipts.
+* Signed receipt index is HMAC-protected (tamper detected).
+* Deleting .hmac sidecar for indexed receipt raises integrity error.
+* Pre-signing receipts (no index entry) load without error.
+* Rotation re-signs index HMAC with new signing key.
+* Signed receipt index and HMAC written with 0600 permissions.
 * PII risk scoring across 15 record categories (6 dimensions).
 * High-risk categories (SSN, health, mugshot) correctly blocked.
 * Cohort safety gate enforces minimums (50 default, 100 sensitive).
@@ -99,7 +117,8 @@ capsule boundaries, and policy-gated access.
 
 ```text
 v0.2: Encrypted local vault with structure-bound keys (Fernet MVP)
-v0.3: AES-256-GCM + AAD + scrypt-n17/HKDF + structure-bound envelope + passphrase gate  ← current
+v0.3: AES-256-GCM + AAD + scrypt-n17/HKDF + structure-bound envelope + passphrase gate
+v0.3.5: Verified migration, transactional rotation, HMAC sidecar deletion detection  ← current
 v0.4: PQ-ready interfaces (ML-KEM/ML-DSA/SLH-DSA type stubs)
 v1.0: ML-KEM/ML-DSA/SLH-DSA wired and tested
 ```

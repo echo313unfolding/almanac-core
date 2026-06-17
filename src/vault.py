@@ -97,6 +97,21 @@ SCHEMA_TO_SUBDIR = {
     "almanac.reappearance.v1": "reappearances",
 }
 
+ROTATION_JOURNAL = "rotation_journal.json"
+SIGNED_RECEIPTS_INDEX = "signed_receipts.json"
+
+
+def _write_journal(path: Path, data: dict) -> None:
+    """Write rotation journal with 0600 permissions."""
+    _secure_write_text(path, json.dumps(data, indent=2) + "\n")
+
+
+def _update_journal_phase(path: Path, phase: str) -> None:
+    """Update the phase field of an existing rotation journal."""
+    data = json.loads(path.read_text())
+    data["phase"] = phase
+    _secure_write_text(path, json.dumps(data, indent=2) + "\n")
+
 
 class Vault:
     """Local receipt vault with structure-bound encryption at rest for evidence.
@@ -159,9 +174,11 @@ class Vault:
                 f"Created: {datetime.now(timezone.utc).isoformat()}\n"
             )
         if self._vault_secret and self._user_commitment:
+            self._recover_rotation()          # Stage 1: pre-crypto disk recovery
             self._init_v1_encryption()
             self._init_v2_encryption()
             self._init_signing_key()
+            self._finish_rotation_recovery()  # Stage 2: post-crypto re-sign
             self._migrate_v1_to_v2()
         return self.root
 
@@ -204,53 +221,191 @@ class Vault:
             self._v2_scrypt_salt,
         )
 
+    def _recover_rotation(self):
+        """Stage 1 rotation recovery: fix disk state before crypto init.
+
+        If rotation was interrupted before commit, rolls back (deletes temp files).
+        If rotation was committed but not finished, completes renames and updates salt.
+        """
+        journal_path = self.root / ROTATION_JOURNAL
+        if not journal_path.exists():
+            return
+
+        journal = json.loads(journal_path.read_text())
+        phase = journal.get("phase", "")
+        evidence_dir = self.root / "evidence"
+
+        if phase in ("started", "wrote_tmp", "verified_tmp"):
+            # Pre-commit: safe rollback — old .v2.json files are untouched
+            if evidence_dir.exists():
+                for tmp in evidence_dir.glob("*.v2.json.rotating"):
+                    tmp.unlink()
+            journal_path.unlink()
+            return
+
+        if phase in ("committed", "salt_updated"):
+            new_salt_hex = journal.get("new_scrypt_salt_hex", "")
+            if not new_salt_hex:
+                journal_path.unlink()
+                return
+            # Complete any remaining renames
+            if evidence_dir.exists():
+                for tmp in evidence_dir.glob("*.v2.json.rotating"):
+                    final = tmp.with_suffix("")  # .v2.json.rotating → .v2.json
+                    tmp.rename(final)
+            # Update scrypt salt to new value
+            _secure_write_text(
+                self.root / SCRYPT_SALT_FILE, new_salt_hex + "\n"
+            )
+            # Keep journal for stage 2 (re-signing)
+            _update_journal_phase(journal_path, "salt_updated")
+            return
+
+        # Unknown phase — clean up
+        journal_path.unlink()
+
+    def _finish_rotation_recovery(self):
+        """Stage 2 rotation recovery: re-sign receipts after crypto is initialized."""
+        journal_path = self.root / ROTATION_JOURNAL
+        if not journal_path.exists():
+            return
+        journal = json.loads(journal_path.read_text())
+        if journal.get("phase") in ("committed", "salt_updated"):
+            for receipt_path in self.list_receipts():
+                self._sign_receipt(receipt_path)
+            journal_path.unlink()
+
+    def _load_signed_index(self) -> set:
+        """Load the signed receipt index, verifying its HMAC."""
+        path = self.root / SIGNED_RECEIPTS_INDEX
+        if not path.exists():
+            return set()
+        hmac_path = path.with_suffix(".hmac")
+        if self._signing_key and hmac_path.exists():
+            expected = hmac_path.read_text().strip()
+            data = path.read_bytes()
+            if not verify_hmac(data, self._signing_key, expected):
+                raise ValueError(
+                    "Signed receipt index has been tampered with"
+                )
+        return set(json.loads(path.read_text()))
+
+    def _save_signed_index(self, index: set) -> None:
+        """Save and HMAC-sign the receipt index."""
+        path = self.root / SIGNED_RECEIPTS_INDEX
+        content = json.dumps(sorted(index), indent=2) + "\n"
+        _secure_write_text(path, content)
+        if self._signing_key:
+            mac = compute_hmac(content.encode(), self._signing_key)
+            _secure_write_text(path.with_suffix(".hmac"), mac + "\n")
+
     def _migrate_v1_to_v2(self):
         """Auto-migrate legacy .enc evidence files to v2 .v2.json.
 
         Runs on every init when both v1 key and v2 salts are available.
-        Decrypts with v1 Fernet, re-encrypts with v2 AES-256-GCM,
-        then removes the old .enc file.
+        Verified migration: write .tmp → verify decrypt → rename → archive .enc.
+
+        Recovery: if .v2.json is corrupt but .enc exists, re-migrates.
+        Interrupted migrations (.migrating temp files) are cleaned up on init.
         """
         if not self._vault_key or not self._v2_vault_salt:
             return
         evidence_dir = self.root / "evidence"
         if not evidence_dir.exists():
             return
+
+        # Clean up any interrupted migration temp files
+        for tmp in evidence_dir.glob("*.v2.json.migrating"):
+            tmp.unlink()
+
         for enc_path in sorted(evidence_dir.glob("*.enc")):
-            evidence_hash = enc_path.stem  # e.g. "abc123def456" from "abc123def456.enc"
+            evidence_hash = enc_path.stem
             v2_path = evidence_dir / f"{evidence_hash}.v2.json"
+            migrated_path = evidence_dir / f"{evidence_hash}.enc.migrated"
+
             if v2_path.exists():
-                continue  # already migrated
+                # Verify .v2.json decrypts before archiving .enc
+                try:
+                    ctx = self._default_structure_context(evidence_hash)
+                    stored = json.loads(v2_path.read_text())
+                    ciphertext = bytes.fromhex(stored["ciphertext_hex"])
+                    envelope = EncryptedEnvelope.from_stored(stored, ciphertext)
+                    _v2_decrypt(
+                        envelope, self._vault_secret,
+                        self._user_commitment,
+                        self._v2_vault_salt, self._v2_scrypt_salt, ctx,
+                    )
+                    # Valid — archive .enc
+                    enc_path.rename(migrated_path)
+                    continue
+                except Exception:
+                    # Corrupt .v2.json — delete and re-migrate below
+                    v2_path.unlink()
+
+            # Decrypt with v1 Fernet
             plaintext = _fernet_decrypt(enc_path.read_bytes(), self._vault_key)
             ctx = self._default_structure_context(evidence_hash)
             envelope = _v2_encrypt(
-                plaintext,
-                self._vault_secret,
-                self._user_commitment,
-                self._v2_vault_salt,
-                self._v2_scrypt_salt,
-                ctx,
+                plaintext, self._vault_secret, self._user_commitment,
+                self._v2_vault_salt, self._v2_scrypt_salt, ctx,
             )
             stored = envelope.to_dict()
             stored["ciphertext_hex"] = envelope.ciphertext.hex()
-            _secure_write_text(v2_path, json.dumps(stored, indent=2) + "\n")
-            enc_path.unlink()
+
+            # Write to temp file first
+            tmp_path = evidence_dir / f"{evidence_hash}.v2.json.migrating"
+            _secure_write_text(
+                tmp_path, json.dumps(stored, indent=2) + "\n"
+            )
+
+            # Verify temp decrypts to same plaintext
+            verify_stored = json.loads(tmp_path.read_text())
+            verify_ct = bytes.fromhex(verify_stored["ciphertext_hex"])
+            verify_env = EncryptedEnvelope.from_stored(verify_stored, verify_ct)
+            recovered = _v2_decrypt(
+                verify_env, self._vault_secret, self._user_commitment,
+                self._v2_vault_salt, self._v2_scrypt_salt, ctx,
+            )
+            if recovered != plaintext:
+                tmp_path.unlink()
+                raise RuntimeError(
+                    f"Migration verification failed for {evidence_hash}: "
+                    "decrypted content does not match original"
+                )
+
+            # Atomic rename: temp → final
+            tmp_path.rename(v2_path)
+            # Archive .enc (not delete)
+            enc_path.rename(migrated_path)
 
     def _sign_receipt(self, path: Path) -> None:
-        """Write HMAC-SHA256 sidecar for a receipt file."""
+        """Write HMAC-SHA256 sidecar and record in signed receipt index."""
         if not self._signing_key:
             return
         data = path.read_bytes()
         mac = compute_hmac(data, self._signing_key)
         _secure_write_text(path.with_suffix(".hmac"), mac + "\n")
+        # Track this receipt in the signed index
+        index = self._load_signed_index()
+        index.add(path.name)
+        self._save_signed_index(index)
 
     def _verify_receipt_hmac(self, path: Path) -> None:
-        """Verify HMAC sidecar if it exists and vault has signing key.
+        """Verify HMAC sidecar. Raises on tamper or missing sidecar for indexed receipt.
 
-        Raises ValueError on mismatch. Silent if no sidecar or no key.
+        If the receipt is in the signed receipt index, its .hmac MUST exist —
+        a missing sidecar means someone deleted it (integrity attack).
         """
         hmac_path = path.with_suffix(".hmac")
         if not hmac_path.exists():
+            if self._signing_key:
+                index = self._load_signed_index()
+                if path.name in index:
+                    raise ValueError(
+                        f"Receipt HMAC sidecar missing for {path.name} — "
+                        "file is in the signed receipt index but .hmac was "
+                        "deleted (possible integrity attack)"
+                    )
             return
         if not self._signing_key:
             return  # can't verify without key
@@ -454,15 +609,16 @@ class Vault:
     def rotate_secret(self, new_secret: str) -> dict:
         """Rotate vault_secret: re-encrypt all evidence with new key material.
 
-        Steps:
-          1. Validate new secret strength
-          2. Decrypt all evidence with current secret
-          3. Generate new scrypt salt (vault_salt stays — identifies the vault)
-          4. Re-encrypt all evidence with new secret + new scrypt salt
-          5. Re-sign all receipts with new signing key
-          6. Return summary of what was rotated
+        Transactional with journal. Phases:
+          1. Validate → 2. Decrypt old → 3. Write .rotating temps →
+          4. Verify temps decrypt → 5. Commit (rename + salt) →
+          6. Re-sign receipts → 7. Delete journal
 
-        Raises ValueError if vault is not encrypted or new secret is weak.
+        Rollback: if anything fails before commit, all temp files are deleted
+        and the journal is removed. Old evidence is untouched.
+
+        Recovery: if the process crashes mid-commit, init() detects the
+        journal and completes the operation on next open.
         """
         if not self.encrypted:
             raise ValueError("Cannot rotate: vault is not encrypted")
@@ -473,6 +629,8 @@ class Vault:
             raise ValueError("New secret must differ from current secret")
 
         evidence_dir = self.root / "evidence"
+        journal_path = self.root / ROTATION_JOURNAL
+
         # Phase 1: Decrypt all evidence with current secret
         evidence_items: list[tuple[str, bytes, Path]] = []
         if evidence_dir.exists():
@@ -481,37 +639,73 @@ class Vault:
                 plaintext = self.load_evidence(evidence_hash)
                 evidence_items.append((evidence_hash, plaintext, v2_path))
 
-        # Phase 2: Generate new scrypt salt, re-derive keys
+        # Phase 2: Generate new scrypt salt + write journal
         new_scrypt_salt = generate_salt()
-        old_scrypt_path = self.root / SCRYPT_SALT_FILE
+        _write_journal(journal_path, {
+            "phase": "started",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "new_scrypt_salt_hex": new_scrypt_salt.hex(),
+            "evidence_hashes": [h for h, _, _ in evidence_items],
+        })
 
-        # Phase 3: Re-encrypt all evidence
-        new_paths: list[tuple[Path, Path]] = []  # (new_path, old_path)
-        for evidence_hash, plaintext, old_path in evidence_items:
-            ctx = self._default_structure_context(evidence_hash)
-            envelope = _v2_encrypt(
-                plaintext,
-                new_secret,
-                self._user_commitment,
-                self._v2_vault_salt,
-                new_scrypt_salt,
-                ctx,
-            )
-            stored = envelope.to_dict()
-            stored["ciphertext_hex"] = envelope.ciphertext.hex()
-            # Write to .tmp first, rename after all succeed
-            tmp_path = old_path.with_suffix(".v2.json.tmp")
-            _secure_write_text(tmp_path, json.dumps(stored, indent=2) + "\n")
-            new_paths.append((tmp_path, old_path))
+        # Phase 3+4: Re-encrypt to .rotating temps + verify (with rollback)
+        tmp_files: list[tuple[Path, Path]] = []
+        try:
+            for evidence_hash, plaintext, old_path in evidence_items:
+                ctx = self._default_structure_context(evidence_hash)
+                envelope = _v2_encrypt(
+                    plaintext, new_secret, self._user_commitment,
+                    self._v2_vault_salt, new_scrypt_salt, ctx,
+                )
+                stored = envelope.to_dict()
+                stored["ciphertext_hex"] = envelope.ciphertext.hex()
+                tmp_path = evidence_dir / f"{evidence_hash}.v2.json.rotating"
+                _secure_write_text(
+                    tmp_path, json.dumps(stored, indent=2) + "\n"
+                )
+                tmp_files.append((tmp_path, old_path))
 
-        # Phase 4: Atomic-ish commit — rename all .tmp to .v2.json
-        for tmp_path, old_path in new_paths:
+            _update_journal_phase(journal_path, "wrote_tmp")
+
+            # Verify ALL temp files decrypt to correct plaintext
+            for evidence_hash, plaintext, _ in evidence_items:
+                tmp_path = evidence_dir / f"{evidence_hash}.v2.json.rotating"
+                verify_stored = json.loads(tmp_path.read_text())
+                verify_ct = bytes.fromhex(verify_stored["ciphertext_hex"])
+                verify_env = EncryptedEnvelope.from_stored(
+                    verify_stored, verify_ct
+                )
+                ctx = self._default_structure_context(evidence_hash)
+                recovered = _v2_decrypt(
+                    verify_env, new_secret, self._user_commitment,
+                    self._v2_vault_salt, new_scrypt_salt, ctx,
+                )
+                if recovered != plaintext:
+                    raise RuntimeError(
+                        f"Rotation verification failed for {evidence_hash}"
+                    )
+
+            _update_journal_phase(journal_path, "verified_tmp")
+
+        except Exception:
+            # Rollback: delete all temp files + journal
+            for tmp_path, _ in tmp_files:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            if journal_path.exists():
+                journal_path.unlink()
+            raise
+
+        # Phase 5: Commit — rename all .rotating → .v2.json
+        for tmp_path, old_path in tmp_files:
             tmp_path.rename(old_path)
 
-        # Phase 5: Update scrypt salt on disk
-        _secure_write_text(old_scrypt_path, new_scrypt_salt.hex() + "\n")
+        _update_journal_phase(journal_path, "committed")
 
-        # Phase 6: Update internal state
+        # Phase 6: Update scrypt salt on disk + internal state
+        _secure_write_text(
+            self.root / SCRYPT_SALT_FILE, new_scrypt_salt.hex() + "\n"
+        )
         self._vault_secret = new_secret
         self._v2_scrypt_salt = new_scrypt_salt
         self._signing_key = derive_signing_key(
@@ -519,11 +713,20 @@ class Vault:
             self._v2_vault_salt, new_scrypt_salt,
         )
 
-        # Phase 7: Re-sign all receipts
+        # Phase 7: Re-sign index HMAC with new key (old HMAC is stale)
+        index_path = self.root / SIGNED_RECEIPTS_INDEX
+        if index_path.exists():
+            raw_entries = set(json.loads(index_path.read_text()))
+            self._save_signed_index(raw_entries)
+
+        # Phase 8: Re-sign all receipts with new signing key
         receipts_signed = 0
         for receipt_path in self.list_receipts():
             self._sign_receipt(receipt_path)
             receipts_signed += 1
+
+        # Phase 9: Clean up journal
+        journal_path.unlink()
 
         return {
             "evidence_rotated": len(evidence_items),
