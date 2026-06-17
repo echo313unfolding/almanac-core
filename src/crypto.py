@@ -1,10 +1,17 @@
 """Almanac Core — Vault encryption at rest.
 
-Protein-inspired structure-as-key: the encryption key is derived from the
-user's identity commitment + a vault-local salt. The structure (who you are +
-where you store) IS the key. No separate key file to lose or steal.
+Three inputs to derive the vault encryption key:
 
-    vault_key = HKDF(user_commitment || vault_salt)
+    vault_key = HKDF(vault_secret + user_commitment + vault_salt)
+
+Where:
+    user_commitment = public/exportable identity hash (appears in receipts)
+    vault_salt      = random per-vault salt (stored in vault directory)
+    vault_secret    = private passphrase or device key (NEVER stored in vault)
+
+The user_commitment and vault_salt bind the key to a specific identity and
+vault instance (the structure/context). The vault_secret unlocks the key.
+Neither the commitment nor the salt alone can derive the key.
 
 Evidence files are encrypted. Receipts are plaintext (they contain no PII
 by schema design — raw_pii_stored=false is enforced).
@@ -28,14 +35,20 @@ def generate_vault_salt() -> str:
     return os.urandom(32).hex()
 
 
-def derive_vault_key(user_commitment: str, vault_salt: str) -> bytes:
-    """Derive a Fernet-compatible encryption key from identity commitment + salt.
+def derive_vault_key(vault_secret: str, user_commitment: str, vault_salt: str) -> bytes:
+    """Derive a Fernet-compatible encryption key.
 
-    The user_commitment is SHA-256(name|email|user_salt) — it's the secret.
-    The vault_salt is random per-vault — stored in the vault directory.
-    Together they derive a unique encryption key via HKDF.
+    vault_secret:    private passphrase/device key — the actual secret
+    user_commitment: public identity hash — binds key to identity
+    vault_salt:      random per-vault — binds key to this vault instance
+
+    The secret provides the entropy. The commitment and salt provide context
+    binding so the same passphrase on a different vault or identity produces
+    a different key.
     """
-    ikm = hashlib.sha256(f"{user_commitment}|{vault_salt}".encode()).digest()
+    ikm = hashlib.sha256(
+        f"{vault_secret}|{user_commitment}|{vault_salt}".encode()
+    ).digest()
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,

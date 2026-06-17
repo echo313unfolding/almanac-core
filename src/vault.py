@@ -3,8 +3,9 @@
 Stores receipts in a local directory structure. User-owned. Exportable.
 No cloud, no blockchain required. Just files.
 
-Evidence files are encrypted at rest when a user_commitment is provided.
-Receipts are plaintext (they contain no PII by schema design).
+Evidence files are encrypted at rest when a vault_secret is provided.
+Receipts are portable and plaintext (they contain no PII by schema design).
+The vault_secret must never be committed, exported, or stored in the vault.
 """
 
 import json
@@ -47,11 +48,21 @@ SCHEMA_TO_SUBDIR = {
 
 
 class Vault:
-    """Local receipt vault with optional encryption at rest for evidence."""
+    """Local receipt vault with optional encryption at rest for evidence.
 
-    def __init__(self, root: Path | str | None = None, user_commitment: str = ""):
+    Encryption requires both user_commitment (public, appears in receipts)
+    and vault_secret (private passphrase/device key, never stored here).
+    """
+
+    def __init__(
+        self,
+        root: Path | str | None = None,
+        user_commitment: str = "",
+        vault_secret: str = "",
+    ):
         self.root = Path(root) if root else DEFAULT_VAULT
         self._user_commitment = user_commitment
+        self._vault_secret = vault_secret
         self._vault_key: bytes | None = None
 
     def init(self) -> Path:
@@ -66,19 +77,21 @@ class Vault:
                 "You own this data. It never leaves your machine unless you export it.\n\n"
                 f"Created: {datetime.now(timezone.utc).isoformat()}\n"
             )
-        if self._user_commitment:
+        if self._vault_secret and self._user_commitment:
             self._init_encryption()
         return self.root
 
     def _init_encryption(self):
-        """Initialize or load vault encryption key from salt + user commitment."""
+        """Initialize or load vault encryption key from secret + commitment + salt."""
         salt_path = self.root / VAULT_SALT_FILE
         if salt_path.exists():
             vault_salt = salt_path.read_text().strip()
         else:
             vault_salt = generate_vault_salt()
             salt_path.write_text(vault_salt + "\n")
-        self._vault_key = derive_vault_key(self._user_commitment, vault_salt)
+        self._vault_key = derive_vault_key(
+            self._vault_secret, self._user_commitment, vault_salt
+        )
 
     @property
     def encrypted(self) -> bool:
@@ -136,7 +149,9 @@ class Vault:
         bin_path = evidence_dir / f"{evidence_hash[:16]}.bin"
         if enc_path.exists():
             if not self._vault_key:
-                raise ValueError("Evidence is encrypted but no user_commitment provided")
+                raise ValueError(
+                "Evidence is encrypted but no vault_secret provided"
+            )
             return decrypt_evidence(enc_path.read_bytes(), self._vault_key)
         elif bin_path.exists():
             return bin_path.read_bytes()

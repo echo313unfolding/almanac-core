@@ -5,9 +5,9 @@ Open receipt protocol for personal data-rights infrastructure.
 ## Audit Gate
 
 ```text
-Almanac Core receipt protocol: 56/56 PASS
+Almanac Core receipt protocol: 60/60 PASS
   test_receipts:  27 (schemas, chain, vault, demo)
-  test_crypto:    10 (key derivation, encrypt/decrypt, vault encryption)
+  test_crypto:    14 (key derivation, encrypt/decrypt, vault encryption, security)
   test_safety:    19 (risk scoring, cohort gates, contextual adjustments)
 ```
 
@@ -23,7 +23,10 @@ Almanac Core receipt protocol: 56/56 PASS
 * End-to-end privacy receipt demo runs.
 * No raw PII is required in receipts.
 * Vault evidence encrypted at rest (HKDF + Fernet/AES).
-* Wrong user commitment cannot decrypt evidence.
+* Encryption requires vault_secret (private) + user_commitment (public) + vault_salt.
+* Public components alone (commitment + salt) cannot derive the vault key.
+* Commitment without secret does not enable encryption (fail-safe).
+* Wrong secret cannot decrypt evidence.
 * Vault salt persists across reopens.
 * PII risk scoring across 15 record categories (6 dimensions).
 * High-risk categories (SSN, health, mugshot) correctly blocked.
